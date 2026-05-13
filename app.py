@@ -14,18 +14,15 @@ st.set_page_config(page_title="NHS Vision - Planejamento", layout="wide")
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
 URL_BASE = f"https://docs.google.com/spreadsheets/d/{ID_PLANILHA}/export?format=csv&gid=0"
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def carregar_base():
     try:
         res = requests.get(URL_BASE)
         df = pd.read_csv(StringIO(res.text), header=None).astype(str)
-        # Aqui você pode manter a lógica de limpeza do seu código original
         return df
     except: return pd.DataFrame()
 
-base_raw = carregar_base()
-
-# --- 2. SIDEBAR (IGUAL AO ANTERIOR) ---
+# --- 2. SIDEBAR ---
 st.sidebar.title("🏭 Configurações")
 sel_ups = st.sidebar.selectbox("Célula de Trabalho", ["UPS - 1", "UPS - 2", "UPS - 3", "UPS - 4", "UPS - 6", "UPS - 7", "UPS - 8", "ACS - 01"])
 h_ini = st.sidebar.text_input("Início da Produção", "07:45")
@@ -35,33 +32,47 @@ tem_gin = st.sidebar.checkbox("🤸 Ginástica Laboral?")
 st.title("📸 NHS Vision - Leitura Automática")
 arquivo = st.file_uploader("Suba o print da programação", type=["png", "jpg", "jpeg"])
 
-lista_detectada = []
+# Inicializa o estado da tabela se não existir
+if 'dados_lidos' not in st.session_state:
+    st.session_state.dados_lidos = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
 if arquivo:
     img = Image.open(arquivo)
     if st.button("🔍 Ler Imagem e Gerar Tabela"):
-        with st.spinner("Extraindo dados da imagem..."):
-            img_np = np.array(img)
-            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        with st.spinner("Processando imagem..."):
+            img_np = np.array(img.convert('RGB'))
             
-            # Tenta ler o texto
-            try:
-                texto = pytesseract.image_to_string(gray)
-                
-                # Procura Modelo (85.A1...) e Quantidade (número antes de un)
-                modelos = re.findall(r"(85\.[A-Z0-9\.]+)", texto)
-                qtds = re.findall(r"(\d+[\.,]\d+|\d+)\s*\(un\)", texto)
-                
-                for m, q in zip(modelos, qtds):
-                    lista_detectada.append({"Equipamento": m, "Qtd": q})
-            except Exception as e:
-                st.error("O motor de leitura ainda não está pronto. Aguarde o Reboot ou verifique o packages.txt.")
+            # --- MELHORIA DA IMAGEM PARA O OCR ---
+            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            # Aumenta o contraste e remove ruído
+            _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            texto = pytesseract.image_to_string(thresh, lang='eng')
+            
+            # Expressões Regulares para capturar os padrões NHS
+            # Padrão 1: Códigos que começam com 190 ou 85
+            # Padrão 2: Números seguidos de (un)
+            p_modelos = re.findall(r"((?:190|85)\.[A-Z0-9\.]+)", texto)
+            p_qtds = re.findall(r"(\d+[\.,]\d+|\d+)\s*\(un\)", texto)
+            
+            novos_dados = []
+            for m, q in zip(p_modelos, p_qtds):
+                novos_dados.append({"Equipamento": m, "Qtd": q})
+            
+            if novos_dados:
+                st.session_state.dados_lidos = pd.DataFrame(novos_dados)
+                st.success(f"Encontrados {len(novos_dados)} itens!")
+            else:
+                st.warning("Não foi possível identificar modelos. Verifique se o print está nítido.")
 
-# --- 4. EDITOR DE DADOS (PRÉ-PREENCHIDO) ---
+# --- 4. EDITOR DE DADOS ---
 st.subheader("📋 Itens para Planejamento")
-df_para_editar = pd.DataFrame(lista_detectada if lista_detectada else [{}], columns=["Equipamento", "Qtd"])
-
-df_ed = st.data_editor(df_para_editar, num_rows="dynamic", use_container_width=True)
+df_ed = st.data_editor(st.session_state.dados_lidos, num_rows="dynamic", use_container_width=True)
 
 if st.button("🚀 Gerar Cronograma"):
-    st.info("Aqui entrará a lógica de cálculo que você já tem no outro código!")
+    if not df_ed.empty:
+        st.write("### Dados Finais para Processamento:")
+        st.dataframe(df_ed)
+        st.balloons()
+    else:
+        st.error("A tabela está vazia!")
