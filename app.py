@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # --- 1. CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="NHS Vision - Planejamento", page_icon="🏭", layout="wide")
 
-# Link da sua planilha (Aba BASE)
+# Link da sua planilha (Certifique-se que a aba BASE é a 1ª da esquerda)
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
 URL_BASE = f"https://docs.google.com/spreadsheets/d/{ID_PLANILHA}/export?format=csv&gid=0"
 
@@ -27,26 +27,27 @@ MAPA_N_NATURAL = {
 @st.cache_data(ttl=60)
 def carregar_base():
     try:
-        # Tenta carregar a planilha diretamente como CSV
-        response = requests.get(URL_BASE, timeout=15)
+        # Tenta carregar a planilha diretamente
+        response = requests.get(URL_BASE, timeout=20)
         if response.status_code != 200:
             return pd.DataFrame()
             
         df_raw = pd.read_csv(StringIO(response.text), header=None).astype(str)
         
-        # Procura a célula que contém "MODELO" (ignora maiúsculas/minúsculas)
+        # BUSCA ROBUSTA: Varre as primeiras 100 linhas e todas as colunas
         m_row, m_col = -1, -1
         for r in range(min(100, len(df_raw))):
             for c in range(len(df_raw.columns)):
-                if "MODELO" in str(df_raw.iloc[r, c]).upper().strip():
+                conteudo = str(df_raw.iloc[r, c]).upper().strip()
+                if conteudo == "MODELO":
                     m_row, m_col = r, c
                     break
             if m_row != -1: break
             
         if m_row == -1:
-            return pd.DataFrame()
+            return pd.DataFrame() # Retorna vazio se não achar a palavra MODELO
         
-        # Extrai os dados a partir da linha encontrada
+        # Extrai os dados
         dados = df_raw.iloc[m_row+1:].copy()
         lista_final = []
         cel_atual = "Indefinida"
@@ -54,11 +55,11 @@ def carregar_base():
         for i in range(len(dados)):
             mod = str(dados.iloc[i, m_col]).strip()
             try:
-                # Unidade/Hora está na coluna ao lado do Modelo
+                # Unidade/Hora (coluna B em relação ao Modelo)
                 unid_str = str(dados.iloc[i, m_col+1]).replace(',', '.')
                 unid = pd.to_numeric(unid_str, errors='coerce')
                 
-                # Célula de origem está 3 colunas à direita do Modelo
+                # Célula de origem (coluna D em relação ao Modelo)
                 ups_linha = str(dados.iloc[i, m_col+3]).strip().upper()
                 
                 if any(x in ups_linha for x in ["UPS", "ACS", "ACE"]):
@@ -73,7 +74,7 @@ def carregar_base():
             except: continue
             
         return pd.DataFrame(lista_final)
-    except Exception as e:
+    except:
         return pd.DataFrame()
 
 # --- 3. LÓGICA DE CÁLCULO ---
@@ -90,7 +91,7 @@ def calcular_cronograma(df_input, df_base, h_ini, n_dia, tem_gin):
     marcos = ["08:30", "09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30", "16:30", "17:30"]
     pontos = [h_ini] + [m for m in marcos if para_min(m) > m_ini]
     
-    # Cruza os dados lidos com a base da planilha
+    # Merge com a base
     df_proc = df_input.merge(df_base, left_on='Equipamento', right_on='ID', how='left')
     
     def calc_cad(row):
@@ -169,7 +170,7 @@ if arq:
     img = Image.open(arq)
     if st.button("🔍 LER IMAGEM E PREENCHER"):
         if base_dados.empty:
-            st.error("Erro: A Planilha Base não pôde ser carregada. Verifique se a aba BASE é a primeira da planilha e se contém a coluna 'MODELO'.")
+            st.error("ERRO: Planilha não carregada. Verifique se a aba 'BASE' é a primeira da esquerda e se contém a palavra 'MODELO'.")
         else:
             with st.spinner("Processando imagem..."):
                 img_np = np.array(img.convert('RGB'))
@@ -185,13 +186,13 @@ if arq:
                     if m in base_dados['ID'].values:
                         dados_v.append({"Equipamento": m, "Qtd": int(float(q.replace(',', '.')))})
                     else:
-                        st.warning(f"Modelo {m} não encontrado na base de dados.")
+                        st.warning(f"Modelo {m} não encontrado na planilha BASE.")
                 
                 if dados_v:
                     st.session_state.rows = pd.DataFrame(dados_v)
-                    st.success("Tabela preenchida!")
+                    st.success("Tabela preenchida com o que foi lido!")
 
-st.subheader("📋 Tabela de Produção")
+st.subheader("📋 Dados para o Cálculo")
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
 if st.button("🚀 GERAR CRONOGRAMA"):
@@ -200,9 +201,11 @@ if st.button("🚀 GERAR CRONOGRAMA"):
         st.divider()
         c1, c2 = st.columns(2)
         c1.metric("Total Peças", f"{int(total)} un")
-        c2.metric("Término", fim)
+        c2.metric("Previsão de Término", fim)
         
         def cor_intervalo(row):
             return ['background-color: #f8d7da'] * len(row) if "ALMOÇO" in str(row["Modelos"]) else [''] * len(row)
         
         st.dataframe(df_res.style.apply(cor_intervalo, axis=1), use_container_width=True, height=500)
+    else:
+        st.error("A tabela está vazia. Adicione itens ou leia uma imagem.")
