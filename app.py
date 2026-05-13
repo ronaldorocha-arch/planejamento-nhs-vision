@@ -28,31 +28,31 @@ def carregar_base():
         df_raw = pd.read_csv(StringIO(response.text), header=None).astype(str)
         
         lista_final = []
-        # Percorre todas as linhas e colunas para achar modelos e números
+        # VARREDURA GLOBAL: Procura modelos e cadências em qualquer lugar da planilha
         for r in range(len(df_raw)):
             for c in range(len(df_raw.columns) - 1):
                 celula_val = str(df_raw.iloc[r, c]).strip()
-                # Verifica se a célula parece um modelo (ex: 85.001 ou 01.002)
+                # Verifica se a célula tem o formato de modelo NHS (85..., 01..., 190..., 90...)
                 if re.match(r"^(85|190|90|01)\.", celula_val):
                     try:
-                        # Tenta pegar o número na coluna imediatamente à direita
-                        cadencia = str(df_raw.iloc[r, c+1]).replace(',', '.')
-                        num_cadencia = pd.to_numeric(cadencia, errors='coerce')
+                        # Pega o número da coluna vizinha (Cadência)
+                        cad_str = str(df_raw.iloc[r, c+1]).replace(',', '.')
+                        num_cad = pd.to_numeric(cad_str, errors='coerce')
                         
-                        if not pd.isna(num_cadencia) and num_cadencia > 0:
-                            lista_final.append({'ID': celula_val, 'UNIDADE_HORA': num_cadencia})
+                        if not pd.isna(num_cad) and num_cad > 0:
+                            lista_final.append({'ID': celula_val, 'UNIDADE_HORA': num_cad})
                     except:
                         continue
         
         if not lista_final:
-            return pd.DataFrame(), "Não encontrei modelos (85...) com números de cadência ao lado."
+            return pd.DataFrame(), "Não foram encontrados modelos NHS com cadências válidas."
             
         return pd.DataFrame(lista_final).drop_duplicates('ID'), "Sucesso"
     except Exception as e:
-        return pd.DataFrame(), f"Erro técnico: {str(e)}"
+        return pd.DataFrame(), f"Erro de conexão: {str(e)}"
 
 # --- MOTOR DE CÁLCULO ---
-def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
+def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
     def para_min(s):
         h, m = map(int, s.split(':'))
         return h * 60 + m
@@ -60,13 +60,13 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
     m_ini = para_min(h_ini)
     m_alm_i, m_alm_f = para_min("11:30"), para_min("12:30")
     m_cafe_m, m_cafe_t = para_min("09:20"), para_min("15:20")
-    m_gin_i, m_gin_f = para_min("09:30"), para_min("09:40")
     
     marcos = ["08:30", "09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30", "16:30", "17:30"]
     pontos = [h_ini] + [m for m in marcos if para_min(m) > m_ini]
     
     df_proc = df_in.merge(df_ba, left_on='Equipamento', right_on='ID', how='left')
-    df_proc['UNIDADE_HORA'] = df_proc['UNIDADE_HORA'].fillna(10) # Cadência padrão se não achar
+    # Se não achar na base, usa 10 pç/h como segurança
+    df_proc['UNIDADE_HORA'] = df_proc['UNIDADE_HORA'].fillna(10)
     df_proc['T_PC'] = df_proc['UNIDADE_HORA'].apply(lambda x: 60/x if x > 0 else 0)
     df_proc['FALTA'] = pd.to_numeric(df_proc['Qtd'], errors='coerce').fillna(0)
     
@@ -79,7 +79,7 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
         min_u = 0
         if not is_alm:
             for m in range(p1, p2):
-                if not ((m_cafe_m <= m < m_cafe_m+10) or (m_cafe_t <= m < m_cafe_t+10) or (m_alm_i <= m < m_alm_f) or (tem_gin and m_gin_i <= m < m_gin_f)):
+                if not ((m_cafe_m <= m < m_cafe_m+10) or (m_cafe_t <= m < m_cafe_t+10) or (m_alm_i <= m < m_alm_f)):
                     min_u += 1
         acum += min_u
         p_h, m_n = 0, []
@@ -103,45 +103,56 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
     return pd.DataFrame(resultado), tot, h_fim
 
 # --- INTERFACE ---
-st.sidebar.title("⚙️ Configurações")
+st.sidebar.title("⚙️ Painel de Controle")
 base_dados, msg_base = carregar_base()
 
-if st.sidebar.button("🔄 Atualizar Base"):
+if st.sidebar.button("🔄 Sincronizar Planilha"):
     st.cache_data.clear()
     st.rerun()
 
 sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
-h_ini = st.sidebar.text_input("Início", "07:45")
-n_dia = st.sidebar.number_input(f"Pessoas", 1, 30, value=MAPA_N_NATURAL.get(sel_ups, 5))
+h_ini = st.sidebar.text_input("Hora Início", "07:45")
+n_dia = st.sidebar.number_input("Pessoas", 1, 30, value=MAPA_N_NATURAL.get(sel_ups, 5))
 
 st.title("📸 NHS Vision - Automação")
 
 if 'rows' not in st.session_state:
     st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
-arq = st.file_uploader("Upload do Print", type=["png", "jpg", "jpeg"])
+arq = st.file_uploader("Arraste o print aqui", type=["png", "jpg", "jpeg"])
 
-if arq and st.button("🔍 LER IMAGEM"):
-    with st.spinner("Lendo..."):
+if arq and st.button("🔍 IDENTIFICAR PRODUTOS"):
+    with st.spinner("Processando imagem..."):
         img = Image.open(arq)
         img_np = np.array(img.convert('RGB'))
         img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+        # Filtro para destacar o texto no fundo verde escuro
         mask = cv2.inRange(img_hsv, np.array([35, 40, 20]), np.array([90, 255, 160]))
         texto = pytesseract.image_to_string(mask)
+        
         p_mods = re.findall(r"((?:85|190|90|01)\.[A-Z0-9\.]+)", texto)
-        p_qtds = re.findall(r"(\d+)\s*\(un\)", texto)
-        dados_v = [{"Equipamento": m, "Qtd": int(q)} for m, q in zip(p_mods, p_qtds)]
+        # Captura o número que aparece antes de (un) ou un
+        p_qtds = re.findall(r"(\d+)\s*\(?un\)?", texto)
+        
+        dados_v = []
+        for m, q in zip(p_mods, p_qtds):
+            dados_v.append({"Equipamento": m, "Qtd": int(q)})
+        
         if dados_v:
             st.session_state.rows = pd.DataFrame(dados_v)
-            st.success("✅ Tabela preenchida!")
+            st.success("✅ Produtos e quantidades lidos com sucesso!")
+        else:
+            st.warning("⚠️ Não encontrei dados no print. Verifique se as faixas verdes estão visíveis.")
 
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
-if st.button("🚀 GERAR CRONOGRAMA"):
+if st.button("🚀 GERAR CRONOGRAMA DE PRODUÇÃO"):
     if not df_editado.empty:
-        df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia, True)
+        df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia)
         st.divider()
-        st.metric("Término Previsto", fim)
+        c1, c2 = st.columns(2)
+        c1.metric("Volume Total", f"{int(total)} un")
+        c2.metric("Hora de Término", fim)
         st.dataframe(df_res, use_container_width=True)
 
 if msg_base == "Sucesso":
