@@ -8,71 +8,80 @@ from PIL import Image
 import requests
 from io import StringIO
 
-st.set_page_config(page_title="NHS Vision - Planejamento", layout="wide")
+st.set_page_config(page_title="NHS Vision", layout="wide")
 
-# --- 1. CONFIGURAÇÕES DA BASE ---
+# --- 1. CONFIGURAÇÕES E MAPEAMENTO ---
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
 URL_BASE = f"https://docs.google.com/spreadsheets/d/{ID_PLANILHA}/export?format=csv&gid=0"
 
-@st.cache_data(ttl=60)
+MAPA_N_NATURAL = {
+    "UPS - 1": 5, "UPS - 2": 3, "UPS - 3": 3, "UPS - 4": 3,
+    "UPS - 6": 4, "UPS - 7": 4, "UPS - 8": 4, "ACS - 01": 3,
+}
+
+@st.cache_data
 def carregar_base():
     try:
         res = requests.get(URL_BASE)
-        df = pd.read_csv(StringIO(res.text), header=None).astype(str)
-        return df
+        return pd.read_csv(StringIO(res.text), header=None).astype(str)
     except: return pd.DataFrame()
 
-# --- 2. SIDEBAR ---
+# --- 2. SIDEBAR DINÂMICA ---
 st.sidebar.title("🏭 Configurações")
-sel_ups = st.sidebar.selectbox("Célula de Trabalho", ["UPS - 1", "UPS - 2", "UPS - 3", "UPS - 4", "UPS - 6", "UPS - 7", "UPS - 8", "ACS - 01"])
+sel_ups = st.sidebar.selectbox("Célula de Trabalho", list(MAPA_N_NATURAL.keys()))
 h_ini = st.sidebar.text_input("Início da Produção", "07:45")
+n_sugerido = MAPA_N_NATURAL.get(sel_ups, 5)
+n_dia = st.sidebar.number_input(f"Pessoas na {sel_ups}", 1, 20, value=n_sugerido)
 tem_gin = st.sidebar.checkbox("🤸 Ginástica Laboral?")
 
-# --- 3. ÁREA DE UPLOAD E OCR ---
+# --- 3. LÓGICA DE LEITURA DE IMAGEM ---
 st.title("📸 NHS Vision - Leitura Automática")
 arquivo = st.file_uploader("Suba o print da programação", type=["png", "jpg", "jpeg"])
 
-# Inicializa o estado da tabela se não existir
-if 'dados_lidos' not in st.session_state:
-    st.session_state.dados_lidos = pd.DataFrame(columns=["Equipamento", "Qtd"])
+# Session State para manter os dados na tabela após a leitura
+if 'rows' not in st.session_state:
+    st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
 if arquivo:
     img = Image.open(arquivo)
-    if st.button("🔍 Ler Imagem e Gerar Tabela"):
+    if st.button("🔍 LER IMAGEM AGORA"):
         with st.spinner("Processando imagem..."):
             img_np = np.array(img.convert('RGB'))
-            
-            # --- MELHORIA DA IMAGEM PARA O OCR ---
+            # Tratamento para destacar o texto (Preto e Branco)
             gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-            # Aumenta o contraste e remove ruído
             _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             
-            texto = pytesseract.image_to_string(thresh, lang='eng')
+            texto = pytesseract.image_to_string(thresh)
             
-            # Expressões Regulares para capturar os padrões NHS
-            # Padrão 1: Códigos que começam com 190 ou 85
-            # Padrão 2: Números seguidos de (un)
-            p_modelos = re.findall(r"((?:190|85)\.[A-Z0-9\.]+)", texto)
-            p_qtds = re.findall(r"(\d+[\.,]\d+|\d+)\s*\(un\)", texto)
+            # Busca códigos 85.A1... ou 1904... e quantidades antes de (un)
+            modelos = re.findall(r"((?:85|190)\.[A-Z0-9\.]+)", texto)
+            qtds = re.findall(r"(\d+[\.,]\d+|\d+)\s*\(un\)", texto)
             
-            novos_dados = []
-            for m, q in zip(p_modelos, p_qtds):
-                novos_dados.append({"Equipamento": m, "Qtd": q})
-            
-            if novos_dados:
-                st.session_state.dados_lidos = pd.DataFrame(novos_dados)
-                st.success(f"Encontrados {len(novos_dados)} itens!")
+            if modelos:
+                novos_dados = []
+                for m, q in zip(modelos, qtds):
+                    novos_dados.append({"Equipamento": m, "Qtd": q})
+                st.session_state.rows = pd.DataFrame(novos_dados)
+                st.success(f"Sucesso! {len(modelos)} itens lidos.")
             else:
-                st.warning("Não foi possível identificar modelos. Verifique se o print está nítido.")
+                st.error("Não consegui ler os códigos. Tente um print mais aproximado.")
 
-# --- 4. EDITOR DE DADOS ---
-st.subheader("📋 Itens para Planejamento")
-df_ed = st.data_editor(st.session_state.dados_lidos, num_rows="dynamic", use_container_width=True)
+# --- 4. TABELA EDITÁVEL (DADOS LIDOS APARECEM AQUI) ---
+st.subheader("📋 Itens Identificados")
+df_ed = st.data_editor(
+    st.session_state.rows, 
+    num_rows="dynamic", 
+    use_container_width=True,
+    column_config={
+        "Equipamento": st.column_config.TextColumn("Modelo Lido"),
+        "Qtd": st.column_config.TextColumn("Quantidade")
+    }
+)
 
-if st.button("🚀 Gerar Cronograma"):
+if st.button("🚀 Gerar Planejamento Final"):
     if not df_ed.empty:
-        st.write("### Dados Finais para Processamento:")
+        st.write(f"### Planejamento para {sel_ups} ({n_dia} pessoas)")
         st.dataframe(df_ed)
-        st.balloons()
+        st.success("Tudo pronto! Copie os dados acima para o seu sistema principal.")
     else:
-        st.error("A tabela está vazia!")
+        st.warning("A tabela está vazia. Adicione itens ou leia uma imagem.")
