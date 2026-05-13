@@ -29,6 +29,7 @@ def carregar_base():
         if response.status_code != 200:
             return pd.DataFrame(), f"Erro de conexão: Status {response.status_code}"
         df_raw = pd.read_csv(StringIO(response.text), header=None, quoting=1).astype(str)
+        
         m_row, m_col = -1, -1
         for r in range(min(50, len(df_raw))):
             for c in range(len(df_raw.columns)):
@@ -36,10 +37,13 @@ def carregar_base():
                     m_row, m_col = r, c
                     break
             if m_row != -1: break
+            
         if m_row == -1: return pd.DataFrame(), "Palavra 'MODELO' não encontrada."
+        
         dados = df_raw.iloc[m_row+1:].copy()
         lista_final = []
         cel_atual = "Indefinida"
+        
         for i in range(len(dados)):
             mod = str(dados.iloc[i, m_col]).strip().replace('"', '')
             if mod == 'nan' or len(mod) < 3: continue
@@ -51,11 +55,13 @@ def carregar_base():
                 if not pd.isna(unid):
                     lista_final.append({'ID': mod, 'UNIDADE_HORA': unid, 'CEL_ORIGEM': cel_atual})
             except: continue
-        return pd.DataFrame(lista_final), "Sucesso"
+            
+        df_final = pd.DataFrame(lista_final)
+        return df_final, "Sucesso"
     except Exception as e:
         return pd.DataFrame(), f"Erro: {str(e)}"
 
-# --- 3. LOGICA DE CÁLCULO ---
+# --- 3. LÓGICA DE CÁLCULO ---
 def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
     def para_min(s):
         h, m = map(int, s.split(':'))
@@ -69,9 +75,10 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
     marcos = ["08:30", "09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30", "16:30", "17:30"]
     pontos = [h_ini] + [m for m in marcos if para_min(m) > m_ini]
     
+    # Cruza os dados garantindo que a coluna ID exista
     df_proc = df_in.merge(df_ba, left_on='Equipamento', right_on='ID', how='left')
-    df_proc['CAD_R'] = df_proc.apply(lambda r: (r['UNIDADE_HORA'] / MAPA_N_NATURAL.get(r['CEL_ORIGEM'], 5)) * n_dia, axis=1)
-    df_proc['T_PC'] = 60 / df_proc['CAD_R']
+    df_proc['CAD_R'] = df_proc.apply(lambda r: (r['UNIDADE_HORA'] / MAPA_N_NATURAL.get(r['CEL_ORIGEM'], 5)) * n_dia if pd.notnull(r['UNIDADE_HORA']) else 0, axis=1)
+    df_proc['T_PC'] = df_proc['CAD_R'].apply(lambda x: 60/x if x > 0 else 0)
     df_proc['FALTA'] = pd.to_numeric(df_proc['Qtd'])
     
     resultado, idx, acum, tot, h_fim = [], 0, 0.0, 0, "Finalizado"
@@ -92,7 +99,7 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
             continue
         while idx < len(df_proc):
             t_pc = df_proc.loc[idx, 'T_PC']
-            if acum >= (t_pc - 0.0001):
+            if t_pc > 0 and acum >= (t_pc - 0.0001):
                 q = min(math.floor(acum / t_pc + 0.0001), df_proc.loc[idx, 'FALTA'])
                 if q > 0:
                     acum -= (q * t_pc); df_proc.loc[idx, 'FALTA'] -= q; tot += q; p_h += q
@@ -106,70 +113,65 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
             h_fim = dt.strftime("%H:%M")
     return pd.DataFrame(resultado), tot, h_fim
 
-# --- INTERFACE ---
+# --- 4. INTERFACE ---
 st.sidebar.title("Configurações")
 if st.sidebar.button("🔄 Atualizar Planilha"):
     st.cache_data.clear()
     st.rerun()
 
-base_dados, mensagem_base = carregar_base()
+base_dados, msg_base = carregar_base()
 sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
 h_ini = st.sidebar.text_input("Início", "07:45")
 n_dia = st.sidebar.number_input(f"Pessoas na {sel_ups}", 1, 25, value=MAPA_N_NATURAL.get(sel_ups, 5))
 tem_gin = st.sidebar.checkbox("Ginástica Laboral?", value=True)
 
-st.title("📸 NHS Vision - Automação Total")
+st.title("📸 NHS Vision - Automação")
 
 if 'rows' not in st.session_state:
     st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
-arq = st.file_uploader("Suba o print aqui", type=["png", "jpg", "jpeg"])
+arq = st.file_uploader("Suba o print da programação", type=["png", "jpg", "jpeg"])
 
 if arq:
     img = Image.open(arq)
-    if st.button("🔍 LER IMAGEM AGORA"):
-        with st.spinner("Processando imagem (Verde Escuro)..."):
-            img_np = np.array(img.convert('RGB'))
-            img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-            
-            # Filtro para isolar apenas o Verde Escuro (ajustado para o print)
-            low_green = np.array([35, 50, 20])
-            high_green = np.array([85, 255, 150])
-            mask = cv2.inRange(img_hsv, low_green, high_green)
-            
-            # Melhora o texto para o OCR
-            kernel = np.ones((2,2), np.uint8)
-            mask = cv2.dilate(mask, kernel, iterations=1)
-            
-            texto = pytesseract.image_to_string(mask)
-            
-            # Busca os códigos 85. ou 190. e as quantidades
-            p_mods = re.findall(r"((?:85|190)\.[A-Z0-9\.]+)", texto)
-            p_qtds = re.findall(r"(\d+)\s*\(un\)", texto)
-            
-            dados_v = []
-            for m, q in zip(p_mods, p_qtds):
-                if m in base_dados['ID'].values:
-                    dados_v.append({"Equipamento": m, "Qtd": int(q)})
-            
-            if dados_v:
-                st.session_state.rows = pd.DataFrame(dados_v)
-                st.success(f"✅ {len(dados_v)} itens identificados no verde!")
-            else:
-                st.warning("⚠️ Não consegui ler os dados. Verifique se o print está nítido.")
+    if st.button("🔍 LER IMAGEM E PREENCHER"):
+        if base_dados.empty:
+            st.error(f"Erro na Planilha: {msg_base}")
+        else:
+            with st.spinner("Processando Verde Escuro..."):
+                img_np = np.array(img.convert('RGB'))
+                img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+                
+                # Máscara para capturar apenas o Verde Escuro
+                low_green = np.array([35, 40, 20])
+                high_green = np.array([90, 255, 160])
+                mask = cv2.inRange(img_hsv, low_green, high_green)
+                
+                texto = pytesseract.image_to_string(mask)
+                p_mods = re.findall(r"((?:85|190)\.[A-Z0-9\.]+)", texto)
+                p_qtds = re.findall(r"(\d+)\s*\(un\)", texto)
+                
+                dados_v = []
+                for m, q in zip(p_mods, p_qtds):
+                    if m in base_dados['ID'].values:
+                        dados_v.append({"Equipamento": m, "Qtd": int(q)})
+                
+                if dados_v:
+                    st.session_state.rows = pd.DataFrame(dados_v)
+                    st.success(f"✅ {len(dados_v)} itens lidos!")
+                else:
+                    st.warning("⚠️ Nenhum modelo reconhecido. Tente um print mais nítido.")
 
 st.subheader("📋 Tabela Identificada")
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", width="stretch")
 
-if st.button("🚀 GERAR PLANEJAMENTO"):
+if st.button("🚀 GERAR CRONOGRAMA"):
     if not df_editado.empty and not base_dados.empty:
         df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia, tem_gin)
         st.divider()
         c1, c2 = st.columns(2)
-        c1.metric("Total Planejado", f"{int(total)} pçs")
-        c2.metric("Término Estimado", fim)
-        
-        def highlight_almoco(row):
-            return ['background-color: #fff3cd'] * len(row) if "ALMOÇO" in str(row["Modelos"]) else [''] * len(row)
-        
-        st.dataframe(df_res.style.apply(highlight_almoco, axis=1), width="stretch", height=500)
+        c1.metric("Total Peças", f"{int(total)} un")
+        c2.metric("Previsão de Término", fim)
+        st.dataframe(df_res.style.apply(lambda r: ['background-color: #f8d7da']*len(r) if "ALMOÇO" in str(r["Modelos"]) else ['']*len(r), axis=1), width="stretch", height=500)
+    else:
+        st.error("Tabela vazia ou base não carregada.")
