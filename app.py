@@ -10,7 +10,7 @@ from io import StringIO
 import math
 from datetime import datetime, timedelta
 
-# --- CONFIGURAÇÃO ---
+# --- 1. CONFIGURAÇÃO ---
 st.set_page_config(page_title="NHS Vision - Automação", page_icon="🏭", layout="wide")
 
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
@@ -41,7 +41,7 @@ def carregar_base():
     except:
         return pd.DataFrame(), "Erro na Planilha"
 
-# --- MOTOR DE CÁLCULO ---
+# --- 2. MOTOR DE CÁLCULO ---
 def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
     def para_min(s):
         h, m = map(int, s.split(':'))
@@ -91,7 +91,7 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
             h_fim = dt.strftime("%H:%M")
     return pd.DataFrame(resultado), tot, h_fim
 
-# --- INTERFACE ---
+# --- 3. INTERFACE ---
 st.sidebar.title("⚙️ Configurações")
 base_dados, msg_base = carregar_base()
 sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
@@ -105,8 +105,8 @@ if 'rows' not in st.session_state:
 
 arq = st.file_uploader("Upload do Print", type=["png", "jpg", "jpeg"])
 
-if arq and st.button("🔍 IDENTIFICAR E VALIDAR"):
-    with st.spinner("Analisando imagem e conferindo cadastro..."):
+if arq and st.button("🔍 IDENTIFICAR E VALIDAR TUDO"):
+    with st.spinner("Lendo e conferindo cadastro..."):
         img = Image.open(arq)
         img_np = np.array(img.convert('RGB'))
         img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
@@ -116,42 +116,43 @@ if arq and st.button("🔍 IDENTIFICAR E VALIDAR"):
         contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
         
         dados_lidos = []
-        nao_cadastrados = []
+        faltando_cadastro = []
         
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             if w > 100 and h > 15:
                 roi = mask[y:y+h, x:x+w]
-                # OCR otimizado para linha única
                 line_text = pytesseract.image_to_string(roi, config='--psm 7')
                 
                 mod_match = re.search(r"((?:85|190|90|01)\.[A-Z0-9\.]+)", line_text)
                 qtd_match = re.search(r"(\d+[\.,]?\d*)\s*\(un\)", line_text)
                 
                 if mod_match and qtd_match:
-                    modelo = mod_match.group(1)
+                    modelo = mod_match.group(1).strip()
                     quantidade = int(float(qtd_match.group(1).replace(',', '.')))
                     
                     if quantidade > 0:
-                        # VERIFICAÇÃO DE CADASTRO
+                        # VERIFICAÇÃO CRÍTICA
                         if modelo in base_dados['ID'].values:
                             dados_lidos.append({"Equipamento": modelo, "Qtd": quantidade})
                         else:
-                            nao_cadastrados.append(modelo)
+                            faltando_cadastro.append(modelo)
 
-        # LOGICA DE AVISO
-        if nao_cadastrados:
-            itens_erro = ", ".join(list(set(nao_cadastrados)))
-            st.error(f"🛑 ERRO DE CADASTRO: Os seguintes itens não foram encontrados na Planilha Base: **{itens_erro}**")
-            st.info("Por favor, adicione esses modelos na aba 'BASE' do Google Sheets e clique em 'Atualizar Planilha'.")
+        # BLOQUEIO E AVISO
+        if faltando_cadastro:
+            lista_erro = sorted(list(set(faltando_cadastro)))
+            st.error("🛑 BLOQUEADO: Existem equipamentos no print que NÃO estão cadastrados na planilha!")
+            st.warning("Cadastre estes modelos na aba BASE antes de prosseguir:")
+            for item in lista_erro:
+                st.code(item)
             st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
         elif dados_lidos:
             st.session_state.rows = pd.DataFrame(dados_lidos).drop_duplicates()
-            st.success(f"✅ {len(st.session_state.rows)} equipamentos validados com sucesso!")
+            st.success(f"✅ Todos os {len(st.session_state.rows)} itens foram validados!")
         else:
-            st.warning("Nenhum equipamento com quantidade válida foi detectado no print.")
+            st.warning("⚠️ Nenhum dado detectado no print.")
 
-st.subheader("📋 Dados Identificados")
+st.subheader("📋 Tabela de Produção")
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
 if st.button("🚀 GERAR CRONOGRAMA"):
@@ -160,3 +161,8 @@ if st.button("🚀 GERAR CRONOGRAMA"):
         st.divider()
         st.metric("Término Previsto", fim)
         st.dataframe(df_res, use_container_width=True)
+
+if msg_base == "Sucesso":
+    st.sidebar.success("✅ Base Conectada")
+else:
+    st.sidebar.warning(f"⚠️ {msg_base}")
