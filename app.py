@@ -26,32 +26,21 @@ def carregar_base():
     try:
         response = requests.get(URL_BASE, timeout=15)
         df_raw = pd.read_csv(StringIO(response.text), header=None).astype(str)
-        
         lista_final = []
-        # VARREDURA GLOBAL: Procura modelos e cadências em qualquer lugar da planilha
         for r in range(len(df_raw)):
             for c in range(len(df_raw.columns) - 1):
                 celula_val = str(df_raw.iloc[r, c]).strip()
-                # Verifica se a célula tem o formato de modelo NHS (85..., 01..., 190..., 90...)
                 if re.match(r"^(85|190|90|01)\.", celula_val):
                     try:
-                        # Pega o número da coluna vizinha (Cadência)
                         cad_str = str(df_raw.iloc[r, c+1]).replace(',', '.')
                         num_cad = pd.to_numeric(cad_str, errors='coerce')
-                        
                         if not pd.isna(num_cad) and num_cad > 0:
                             lista_final.append({'ID': celula_val, 'UNIDADE_HORA': num_cad})
-                    except:
-                        continue
-        
-        if not lista_final:
-            return pd.DataFrame(), "Não foram encontrados modelos NHS com cadências válidas."
-            
+                    except: continue
         return pd.DataFrame(lista_final).drop_duplicates('ID'), "Sucesso"
-    except Exception as e:
-        return pd.DataFrame(), f"Erro de conexão: {str(e)}"
+    except:
+        return pd.DataFrame(), "Erro de conexão com a planilha."
 
-# --- MOTOR DE CÁLCULO ---
 def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
     def para_min(s):
         h, m = map(int, s.split(':'))
@@ -65,7 +54,6 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
     pontos = [h_ini] + [m for m in marcos if para_min(m) > m_ini]
     
     df_proc = df_in.merge(df_ba, left_on='Equipamento', right_on='ID', how='left')
-    # Se não achar na base, usa 10 pç/h como segurança
     df_proc['UNIDADE_HORA'] = df_proc['UNIDADE_HORA'].fillna(10)
     df_proc['T_PC'] = df_proc['UNIDADE_HORA'].apply(lambda x: 60/x if x > 0 else 0)
     df_proc['FALTA'] = pd.to_numeric(df_proc['Qtd'], errors='coerce').fillna(0)
@@ -112,50 +100,69 @@ if st.sidebar.button("🔄 Sincronizar Planilha"):
 
 sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
 h_ini = st.sidebar.text_input("Hora Início", "07:45")
-n_dia = st.sidebar.number_input("Pessoas", 1, 30, value=MAPA_N_NATURAL.get(sel_ups, 5))
+n_dia = st.sidebar.number_input("Pessoas na Produção", 1, 30, value=MAPA_N_NATURAL.get(sel_ups, 5))
 
-st.title("📸 NHS Vision - Automação")
+st.title("🏭 NHS Vision - Planejamento Automático")
 
 if 'rows' not in st.session_state:
     st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
-arq = st.file_uploader("Arraste o print aqui", type=["png", "jpg", "jpeg"])
+arq = st.file_uploader("Arraste o print da programação", type=["png", "jpg", "jpeg"])
 
 if arq and st.button("🔍 IDENTIFICAR PRODUTOS"):
     with st.spinner("Processando imagem..."):
         img = Image.open(arq)
         img_np = np.array(img.convert('RGB'))
         img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-        # Filtro para destacar o texto no fundo verde escuro
+        # Filtro para faixas verdes (ajustado para NHS)
         mask = cv2.inRange(img_hsv, np.array([35, 40, 20]), np.array([90, 255, 160]))
+        
         texto = pytesseract.image_to_string(mask)
         
-        p_mods = re.findall(r"((?:85|190|90|01)\.[A-Z0-9\.]+)", texto)
-        # Captura o número que aparece antes de (un) ou un
-        p_qtds = re.findall(r"(\d+)\s*\(?un\)?", texto)
-        
+        # Padrão: Acha o modelo e o número que vem antes do (un)
+        # Ex: "85.A1.B01505 30 (un)" -> Pega o 30
+        linhas = texto.split('\n')
         dados_v = []
-        for m, q in zip(p_mods, p_qtds):
-            dados_v.append({"Equipamento": m, "Qtd": int(q)})
+        
+        for linha in linhas:
+            mod_match = re.search(r"((?:85|190|90|01)\.[A-Z0-9\.]+)", linha)
+            qtd_match = re.search(r"(\d+)\s*\(?un\)?", linha)
+            
+            if mod_match and qtd_match:
+                modelo = mod_match.group(1)
+                quantidade = int(qtd_match.group(1))
+                
+                # SÓ ADICIONA SE A QUANTIDADE FOR MAIOR QUE ZERO
+                if quantidade > 0:
+                    dados_v.append({"Equipamento": modelo, "Qtd": quantidade})
         
         if dados_v:
             st.session_state.rows = pd.DataFrame(dados_v)
-            st.success("✅ Produtos e quantidades lidos com sucesso!")
+            st.success(f"✅ Sucesso! {len(dados_v)} modelos com quantidade identificados.")
         else:
-            st.warning("⚠️ Não encontrei dados no print. Verifique se as faixas verdes estão visíveis.")
+            st.warning("⚠️ Nenhum modelo com quantidade maior que zero foi detectado.")
 
+st.subheader("📋 Tabela de Produção do Dia")
+# Mostra a tabela - Você pode editar se o OCR errar algum número
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
-if st.button("🚀 GERAR CRONOGRAMA DE PRODUÇÃO"):
+if st.button("🚀 GERAR CRONOGRAMA DETALHADO"):
     if not df_editado.empty:
         df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia)
         st.divider()
         c1, c2 = st.columns(2)
         c1.metric("Volume Total", f"{int(total)} un")
-        c2.metric("Hora de Término", fim)
-        st.dataframe(df_res, use_container_width=True)
+        c2.metric("Previsão de Término", fim)
+        
+        # Estilização para o Almoço
+        def style_rows(row):
+            return ['background-color: #fff3cd'] * len(row) if "ALMOÇO" in str(row["Modelos"]) else [''] * len(row)
+            
+        st.dataframe(df_res.style.apply(style_rows, axis=1), use_container_width=True, height=450)
+    else:
+        st.error("Tabela vazia! Use a imagem para preencher ou digite manualmente.")
 
 if msg_base == "Sucesso":
-    st.sidebar.success("✅ Base Conectada")
+    st.sidebar.success("✅ Base de Cadência Conectada")
 else:
     st.sidebar.warning(f"⚠️ {msg_base}")
