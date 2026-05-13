@@ -21,7 +21,7 @@ MAPA_N_NATURAL = {
     "UPS - 6": 4, "UPS - 7": 4, "UPS - 8": 4, "ACS - 01": 3,
 }
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=10) # Cache reduzido para 10 segundos para atualizar rápido
 def carregar_base():
     try:
         response = requests.get(URL_BASE, timeout=15)
@@ -30,16 +30,18 @@ def carregar_base():
         for r in range(len(df_raw)):
             for c in range(len(df_raw.columns) - 1):
                 celula_val = str(df_raw.iloc[r, c]).strip()
-                if re.match(r"^(85|190|90|01)\.", celula_val):
+                if re.match(r"^(85|190|90|01|05)\.", celula_val):
                     try:
                         cad_str = str(df_raw.iloc[r, c+1]).replace(',', '.')
                         num_cad = pd.to_numeric(cad_str, errors='coerce')
                         if not pd.isna(num_cad) and num_cad > 0:
                             lista_final.append({'ID': celula_val, 'UNIDADE_HORA': num_cad})
                     except: continue
-        return pd.DataFrame(lista_final).drop_duplicates('ID'), "Sucesso"
-    except:
-        return pd.DataFrame(), "Erro na Planilha"
+        
+        df_res = pd.DataFrame(lista_final).drop_duplicates('ID')
+        return df_res, f"Sucesso: {len(df_res)} modelos carregados"
+    except Exception as e:
+        return pd.DataFrame(), f"Erro na Planilha: {str(e)}"
 
 # --- 2. MOTOR DE CÁLCULO ---
 def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
@@ -92,10 +94,15 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
     return pd.DataFrame(resultado), tot, h_fim
 
 # --- 3. INTERFACE ---
-st.sidebar.title("⚙️ Configurações")
+st.sidebar.title("⚙️ Painel de Controle")
 base_dados, msg_base = carregar_base()
+
+if st.sidebar.button("🔄 Sincronizar Planilha"):
+    st.cache_data.clear()
+    st.rerun()
+
 sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
-h_ini = st.sidebar.text_input("Início", "07:45")
+h_ini = st.sidebar.text_input("Hora Início", "07:45")
 n_dia = st.sidebar.number_input("Pessoas", 1, 30, value=MAPA_N_NATURAL.get(sel_ups, 5))
 
 st.title("📸 NHS Vision - Automação Total")
@@ -103,10 +110,10 @@ st.title("📸 NHS Vision - Automação Total")
 if 'rows' not in st.session_state:
     st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
-arq = st.file_uploader("Upload do Print", type=["png", "jpg", "jpeg"])
+arq = st.file_uploader("Suba o print aqui", type=["png", "jpg", "jpeg"])
 
-if arq and st.button("🔍 IDENTIFICAR E VALIDAR TUDO"):
-    with st.spinner("Lendo e conferindo cadastro..."):
+if arq and st.button("🔍 IDENTIFICAR E VALIDAR"):
+    with st.spinner("Lendo faixas verdes e cruzando dados..."):
         img = Image.open(arq)
         img_np = np.array(img.convert('RGB'))
         img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
@@ -116,41 +123,38 @@ if arq and st.button("🔍 IDENTIFICAR E VALIDAR TUDO"):
         contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
         
         dados_lidos = []
-        faltando_cadastro = []
+        faltando = []
         
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             if w > 100 and h > 15:
                 roi = mask[y:y+h, x:x+w]
-                line_text = pytesseract.image_to_string(roi, config='--psm 7')
+                text = pytesseract.image_to_string(roi, config='--psm 7')
                 
-                mod_match = re.search(r"((?:85|190|90|01)\.[A-Z0-9\.]+)", line_text)
-                qtd_match = re.search(r"(\d+[\.,]?\d*)\s*\(un\)", line_text)
+                mod_match = re.search(r"((?:85|190|90|01|05)\.[A-Z0-9\.]+)", text)
+                qtd_match = re.search(r"(\d+[\.,]?\d*)\s*\(un\)", text)
                 
                 if mod_match and qtd_match:
                     modelo = mod_match.group(1).strip()
                     quantidade = int(float(qtd_match.group(1).replace(',', '.')))
                     
                     if quantidade > 0:
-                        # VERIFICAÇÃO CRÍTICA
                         if modelo in base_dados['ID'].values:
                             dados_lidos.append({"Equipamento": modelo, "Qtd": quantidade})
                         else:
-                            faltando_cadastro.append(modelo)
+                            faltando.append(modelo)
 
-        # BLOQUEIO E AVISO
-        if faltando_cadastro:
-            lista_erro = sorted(list(set(faltando_cadastro)))
-            st.error("🛑 BLOQUEADO: Existem equipamentos no print que NÃO estão cadastrados na planilha!")
-            st.warning("Cadastre estes modelos na aba BASE antes de prosseguir:")
-            for item in lista_erro:
+        if faltando:
+            st.error("🛑 BLOQUEIO: Existem modelos no print sem cadastro na planilha!")
+            st.warning("Cadastre estes itens na Planilha Base e clique em 'Sincronizar':")
+            for item in sorted(list(set(faltando))):
                 st.code(item)
             st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
         elif dados_lidos:
             st.session_state.rows = pd.DataFrame(dados_lidos).drop_duplicates()
-            st.success(f"✅ Todos os {len(st.session_state.rows)} itens foram validados!")
+            st.success(f"✅ {len(st.session_state.rows)} equipamentos validados!")
         else:
-            st.warning("⚠️ Nenhum dado detectado no print.")
+            st.warning("Nenhum dado encontrado no print.")
 
 st.subheader("📋 Tabela de Produção")
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
@@ -162,7 +166,4 @@ if st.button("🚀 GERAR CRONOGRAMA"):
         st.metric("Término Previsto", fim)
         st.dataframe(df_res, use_container_width=True)
 
-if msg_base == "Sucesso":
-    st.sidebar.success("✅ Base Conectada")
-else:
-    st.sidebar.warning(f"⚠️ {msg_base}")
+st.sidebar.info(msg_base)
