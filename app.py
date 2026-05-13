@@ -10,7 +10,7 @@ from io import StringIO
 import math
 from datetime import datetime, timedelta
 
-# --- 1. CONFIGURAÇÃO DA PÁGINA ---
+# --- 1. CONFIGURAÇÃO ---
 st.set_page_config(page_title="NHS Vision - Automação", page_icon="🏭", layout="wide")
 
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
@@ -21,7 +21,6 @@ MAPA_N_NATURAL = {
     "UPS - 6": 4, "UPS - 7": 4, "UPS - 8": 4, "ACS - 01": 3,
 }
 
-# --- 2. FUNÇÃO DE CARGA COM CACHE CURTO ---
 @st.cache_data(ttl=2) 
 def carregar_base():
     try:
@@ -38,18 +37,11 @@ def carregar_base():
                         if not pd.isna(num_cad) and num_cad > 0:
                             lista_final.append({'ID': celula_val, 'UNIDADE_HORA': num_cad})
                     except: continue
-        df_res = pd.DataFrame(lista_final).drop_duplicates('ID')
-        return df_res, f"✅ Base Sincronizada: {len(df_res)} modelos ativos."
+        return pd.DataFrame(lista_final).drop_duplicates('ID'), "Sucesso"
     except:
-        return pd.DataFrame(), "❌ Erro de conexão com a planilha."
+        return pd.DataFrame(), "Erro de conexão"
 
-# --- 3. FUNÇÃO PARA LER QR CODE ---
-def ler_qr_code(img_np):
-    detector = cv2.QRCodeDetector()
-    valor, pontos, qr_bruto = detector.detectAndDecode(img_np)
-    return valor if valor else None
-
-# --- 4. MOTOR DE CÁLCULO ---
+# --- 2. MOTOR DE CÁLCULO ---
 def calcular_cronograma(df_in, df_ba, h_ini):
     def para_min(s):
         h, m = map(int, s.split(':'))
@@ -98,79 +90,69 @@ def calcular_cronograma(df_in, df_ba, h_ini):
             h_fim = dt.strftime("%H:%M")
     return pd.DataFrame(resultado), tot, h_fim
 
-# --- 5. INTERFACE ---
-st.sidebar.title("⚙️ Painel NHS Vision")
+# --- 3. INTERFACE ---
+st.sidebar.title("⚙️ Configurações")
 base_dados, msg_base = carregar_base()
-if st.sidebar.button("🔄 ATUALIZAR PLANILHA"):
+if st.sidebar.button("🔄 Atualizar Planilha"):
     st.cache_data.clear()
     st.rerun()
 
 sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
-h_ini = st.sidebar.text_input("Hora Início", "07:45")
-st.sidebar.info(msg_base)
+h_ini = st.sidebar.text_input("Início", "07:45")
+st.sidebar.info(f"Base: {msg_base}")
+
+st.title("🏭 NHS Vision - Automação por Imagem")
 
 if 'rows' not in st.session_state:
     st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
-st.title("🏭 NHS Vision - Automação")
-arq = st.file_uploader("Suba o Print ou um QR Code", type=["png", "jpg", "jpeg"])
+arq = st.file_uploader("Suba o print da programação", type=["png", "jpg", "jpeg"])
 
-if arq and st.button("🔍 PROCESSAR IMAGEM"):
-    img = Image.open(arq)
-    img_np = np.array(img.convert('RGB'))
-    
-    # 1. TENTA LER QR CODE
-    dados_qr = ler_qr_code(img_np)
-    
-    if dados_qr:
-        with st.spinner("Decodificando QR Code..."):
-            try:
-                # Espera formato: MOD1,QTD1;MOD2,QTD2
-                itens = dados_qr.split(';')
-                dados_final = []
-                for item in itens:
-                    m, q = item.split(',')
-                    dados_final.append({"Equipamento": m.strip().upper(), "Qtd": int(q)})
-                st.session_state.rows = pd.DataFrame(dados_final)
-                st.success("✅ Dados extraídos do QR Code!")
-            except:
-                st.error("❌ QR Code detectado, mas formato de texto inválido. Use: MODELO,QTD;MODELO,QTD")
-    
-    # 2. SE NÃO FOR QR CODE, TENTA OCR NAS FAIXAS VERDES
-    else:
-        with st.spinner("Analisando faixas verdes..."):
-            img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-            mask = cv2.inRange(img_hsv, np.array([30, 30, 20]), np.array([95, 255, 200]))
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
-            
-            dados_lidos, faltando = [], []
-            for cnt in contours:
-                x, y, w, h = cv2.boundingRect(cnt)
-                if w > 60 and h > 10:
-                    roi = mask[y:y+h, x:x+w]
-                    text = pytesseract.image_to_string(roi, config='--psm 7').lower()
-                    mod_match = re.search(r"((?:85|190|90|01|05)\.[a-z0-9\.]+)", text)
-                    qtd_match = re.search(r"(\d+[\.,]?\d*)\s*\(u", text)
+if arq and st.button("🔍 IDENTIFICAR PRODUTOS"):
+    with st.spinner("Processando faixas verdes..."):
+        img = Image.open(arq)
+        img_np = np.array(img.convert('RGB'))
+        img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+        
+        # Filtro de Verde (Calibrado para o ERP)
+        mask = cv2.inRange(img_hsv, np.array([30, 30, 20]), np.array([95, 255, 220]))
+        
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
+        
+        dados_lidos, faltantes = [], []
+        
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w > 100 and h > 10:
+                roi = mask[y:y+h, x:x+w]
+                # Melhora a nitidez para o OCR
+                text = pytesseract.image_to_string(roi, config='--psm 7').lower()
+                
+                mod_match = re.search(r"((?:85|190|90|01|05)\.[a-z0-9\.]+)", text)
+                qtd_match = re.search(r"(\d+[\.,]?\d*)\s*\(u", text)
+                
+                if mod_match and qtd_match:
+                    modelo = mod_match.group(1).upper().strip()
+                    quantidade = int(float(qtd_match.group(1).replace(',', '.')))
                     
-                    if mod_match and qtd_match:
-                        modelo = mod_match.group(1).upper().strip()
-                        quantidade = int(float(qtd_match.group(1).replace(',', '.')))
+                    if quantidade > 0:
                         if modelo in base_dados['ID'].values:
                             dados_lidos.append({"Equipamento": modelo, "Qtd": quantidade})
                         else:
-                            faltando.append(modelo)
+                            faltantes.append(modelo)
 
-            if faltando:
-                st.error("🛑 BLOQUEIO: Itens lidos não estão na planilha:")
-                for item in sorted(list(set(faltando))): st.code(item)
-            elif dados_lidos:
-                st.session_state.rows = pd.DataFrame(dados_lidos).drop_duplicates()
-                st.success(f"✅ {len(st.session_state.rows)} modelos identificados!")
-            else:
-                st.warning("⚠️ Não foi possível ler. Tente um print com mais zoom ou um QR Code.")
+        if faltantes:
+            st.error("🛑 BLOQUEADO: Equipamentos não cadastrados!")
+            for f in sorted(list(set(faltantes))): st.code(f)
+            st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
+        elif dados_lidos:
+            st.session_state.rows = pd.DataFrame(dados_lidos).drop_duplicates()
+            st.success(f"✅ {len(st.session_state.rows)} modelos validados!")
+        else:
+            st.warning("⚠️ Nenhuma faixa lida. Tente um print com mais zoom.")
 
-st.subheader("📋 Tabela de Produção")
+st.subheader("📋 Conferência")
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
 if st.button("🚀 GERAR CRONOGRAMA"):
@@ -178,5 +160,5 @@ if st.button("🚀 GERAR CRONOGRAMA"):
         df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini)
         st.divider()
         st.metric("Volume Total", f"{int(total)} un")
-        st.metric("Término Previsto", fim)
+        st.metric("Término", fim)
         st.dataframe(df_res, use_container_width=True)
