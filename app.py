@@ -10,8 +10,8 @@ from io import StringIO
 import math
 from datetime import datetime, timedelta
 
-# --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="NHS Vision - Automação", page_icon="🏭", layout="wide")
+# --- 1. CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(page_title="NHS Vision - Planejamento", page_icon="🏭", layout="wide")
 
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
 URL_BASE = f"https://docs.google.com/spreadsheets/d/{ID_PLANILHA}/export?format=csv&gid=0"
@@ -21,6 +21,7 @@ MAPA_N_NATURAL = {
     "UPS - 6": 4, "UPS - 7": 4, "UPS - 8": 4, "ACS - 01": 3,
 }
 
+# --- 2. FUNÇÃO PARA CARREGAR A BASE (BUSCA GLOBAL) ---
 @st.cache_data(ttl=60)
 def carregar_base():
     try:
@@ -41,6 +42,7 @@ def carregar_base():
     except:
         return pd.DataFrame(), "Erro de conexão com a planilha."
 
+# --- 3. MOTOR DE CÁLCULO ---
 def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
     def para_min(s):
         h, m = map(int, s.split(':'))
@@ -90,7 +92,7 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
             h_fim = dt.strftime("%H:%M")
     return pd.DataFrame(resultado), tot, h_fim
 
-# --- INTERFACE ---
+# --- 4. INTERFACE ---
 st.sidebar.title("⚙️ Painel de Controle")
 base_dados, msg_base = carregar_base()
 
@@ -100,69 +102,64 @@ if st.sidebar.button("🔄 Sincronizar Planilha"):
 
 sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
 h_ini = st.sidebar.text_input("Hora Início", "07:45")
-n_dia = st.sidebar.number_input("Pessoas na Produção", 1, 30, value=MAPA_N_NATURAL.get(sel_ups, 5))
+n_dia = st.sidebar.number_input("Pessoas", 1, 30, value=MAPA_N_NATURAL.get(sel_ups, 5))
 
-st.title("🏭 NHS Vision - Planejamento Automático")
+st.title("🏭 NHS Vision - Automação")
 
 if 'rows' not in st.session_state:
     st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
-arq = st.file_uploader("Arraste o print da programação", type=["png", "jpg", "jpeg"])
+arq = st.file_uploader("Suba o print da programação", type=["png", "jpg", "jpeg"])
 
 if arq and st.button("🔍 IDENTIFICAR PRODUTOS"):
-    with st.spinner("Processando imagem..."):
+    with st.spinner("Lendo todos os equipamentos..."):
         img = Image.open(arq)
         img_np = np.array(img.convert('RGB'))
         img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-        # Filtro para faixas verdes (ajustado para NHS)
+        # Isola o verde escuro das faixas
         mask = cv2.inRange(img_hsv, np.array([35, 40, 20]), np.array([90, 255, 160]))
         
         texto = pytesseract.image_to_string(mask)
-        
-        # Padrão: Acha o modelo e o número que vem antes do (un)
-        # Ex: "85.A1.B01505 30 (un)" -> Pega o 30
         linhas = texto.split('\n')
-        dados_v = []
         
+        dados_v = []
         for linha in linhas:
+            # Busca modelo (ex: 85.A1...)
             mod_match = re.search(r"((?:85|190|90|01)\.[A-Z0-9\.]+)", linha)
-            qtd_match = re.search(r"(\d+)\s*\(?un\)?", linha)
+            # Busca quantidade (ex: 6.0 (un) ou 9 (un))
+            qtd_match = re.search(r"(\d+[\.,]?\d*)\s*\(un\)", linha)
             
             if mod_match and qtd_match:
                 modelo = mod_match.group(1)
-                quantidade = int(qtd_match.group(1))
+                # Converte quantidade para inteiro (ex: 6.0 vira 6)
+                quantidade = int(float(qtd_match.group(1).replace(',', '.')))
                 
-                # SÓ ADICIONA SE A QUANTIDADE FOR MAIOR QUE ZERO
                 if quantidade > 0:
                     dados_v.append({"Equipamento": modelo, "Qtd": quantidade})
         
         if dados_v:
-            st.session_state.rows = pd.DataFrame(dados_v)
-            st.success(f"✅ Sucesso! {len(dados_v)} modelos com quantidade identificados.")
+            # Remove duplicados lidos acidentalmente
+            df_temp = pd.DataFrame(dados_v).drop_duplicates()
+            st.session_state.rows = df_temp
+            st.success(f"✅ {len(df_temp)} modelos identificados!")
         else:
-            st.warning("⚠️ Nenhum modelo com quantidade maior que zero foi detectado.")
+            st.warning("⚠️ Nenhum modelo foi encontrado. Tente um print mais nítido.")
 
 st.subheader("📋 Tabela de Produção do Dia")
-# Mostra a tabela - Você pode editar se o OCR errar algum número
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
-if st.button("🚀 GERAR CRONOGRAMA DETALHADO"):
+if st.button("🚀 GERAR CRONOGRAMA"):
     if not df_editado.empty:
         df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia)
         st.divider()
         c1, c2 = st.columns(2)
         c1.metric("Volume Total", f"{int(total)} un")
-        c2.metric("Previsão de Término", fim)
-        
-        # Estilização para o Almoço
-        def style_rows(row):
-            return ['background-color: #fff3cd'] * len(row) if "ALMOÇO" in str(row["Modelos"]) else [''] * len(row)
-            
-        st.dataframe(df_res.style.apply(style_rows, axis=1), use_container_width=True, height=450)
+        c2.metric("Hora de Término", fim)
+        st.dataframe(df_res, use_container_width=True, height=500)
     else:
-        st.error("Tabela vazia! Use a imagem para preencher ou digite manualmente.")
+        st.error("Tabela vazia!")
 
 if msg_base == "Sucesso":
-    st.sidebar.success("✅ Base de Cadência Conectada")
+    st.sidebar.success("✅ Base Conectada")
 else:
     st.sidebar.warning(f"⚠️ {msg_base}")
