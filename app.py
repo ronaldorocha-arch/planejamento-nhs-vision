@@ -10,8 +10,8 @@ from io import StringIO
 import math
 from datetime import datetime, timedelta
 
-# --- 1. CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="NHS Vision - Planejamento", page_icon="🏭", layout="wide")
+# --- 1. CONFIGURAÇÃO ---
+st.set_page_config(page_title="NHS Vision - Automação", page_icon="🏭", layout="wide")
 
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
 URL_BASE = f"https://docs.google.com/spreadsheets/d/{ID_PLANILHA}/export?format=csv&gid=0"
@@ -21,7 +21,6 @@ MAPA_N_NATURAL = {
     "UPS - 6": 4, "UPS - 7": 4, "UPS - 8": 4, "ACS - 01": 3,
 }
 
-# --- 2. FUNÇÃO PARA CARREGAR A BASE (BUSCA GLOBAL) ---
 @st.cache_data(ttl=60)
 def carregar_base():
     try:
@@ -40,9 +39,9 @@ def carregar_base():
                     except: continue
         return pd.DataFrame(lista_final).drop_duplicates('ID'), "Sucesso"
     except:
-        return pd.DataFrame(), "Erro de conexão com a planilha."
+        return pd.DataFrame(), "Erro na Planilha"
 
-# --- 3. MOTOR DE CÁLCULO ---
+# --- 2. MOTOR DE CÁLCULO ---
 def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
     def para_min(s):
         h, m = map(int, s.split(':'))
@@ -92,60 +91,58 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
             h_fim = dt.strftime("%H:%M")
     return pd.DataFrame(resultado), tot, h_fim
 
-# --- 4. INTERFACE ---
-st.sidebar.title("⚙️ Painel de Controle")
+# --- 3. INTERFACE ---
+st.sidebar.title("⚙️ Configurações")
 base_dados, msg_base = carregar_base()
-
-if st.sidebar.button("🔄 Sincronizar Planilha"):
-    st.cache_data.clear()
-    st.rerun()
-
 sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
-h_ini = st.sidebar.text_input("Hora Início", "07:45")
+h_ini = st.sidebar.text_input("Início", "07:45")
 n_dia = st.sidebar.number_input("Pessoas", 1, 30, value=MAPA_N_NATURAL.get(sel_ups, 5))
 
-st.title("🏭 NHS Vision - Automação")
+st.title("📸 NHS Vision - Automação Total")
 
 if 'rows' not in st.session_state:
     st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
-arq = st.file_uploader("Suba o print da programação", type=["png", "jpg", "jpeg"])
+arq = st.file_uploader("Upload do Print", type=["png", "jpg", "jpeg"])
 
-if arq and st.button("🔍 IDENTIFICAR PRODUTOS"):
-    with st.spinner("Lendo todos os equipamentos..."):
+if arq and st.button("🔍 IDENTIFICAR TUDO"):
+    with st.spinner("Processando linhas da programação..."):
         img = Image.open(arq)
         img_np = np.array(img.convert('RGB'))
         img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-        # Isola o verde escuro das faixas
+        
+        # Filtro para as faixas verdes
         mask = cv2.inRange(img_hsv, np.array([35, 40, 20]), np.array([90, 255, 160]))
         
-        texto = pytesseract.image_to_string(mask)
-        linhas = texto.split('\n')
+        # Encontra os contornos das faixas para ler uma por uma
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Ordena de cima para baixo
+        contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
         
         dados_v = []
-        for linha in linhas:
-            # Busca modelo (ex: 85.A1...)
-            mod_match = re.search(r"((?:85|190|90|01)\.[A-Z0-9\.]+)", linha)
-            # Busca quantidade (ex: 6.0 (un) ou 9 (un))
-            qtd_match = re.search(r"(\d+[\.,]?\d*)\s*\(un\)", linha)
-            
-            if mod_match and qtd_match:
-                modelo = mod_match.group(1)
-                # Converte quantidade para inteiro (ex: 6.0 vira 6)
-                quantidade = int(float(qtd_match.group(1).replace(',', '.')))
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w > 100 and h > 15: # Filtra ruídos pequenos
+                roi = mask[y:y+h, x:x+w]
+                # Aumenta o contraste da linha para o OCR
+                line_text = pytesseract.image_to_string(roi, config='--psm 7')
                 
-                if quantidade > 0:
-                    dados_v.append({"Equipamento": modelo, "Qtd": quantidade})
-        
-        if dados_v:
-            # Remove duplicados lidos acidentalmente
-            df_temp = pd.DataFrame(dados_v).drop_duplicates()
-            st.session_state.rows = df_temp
-            st.success(f"✅ {len(df_temp)} modelos identificados!")
-        else:
-            st.warning("⚠️ Nenhum modelo foi encontrado. Tente um print mais nítido.")
+                mod_match = re.search(r"((?:85|190|90|01)\.[A-Z0-9\.]+)", line_text)
+                qtd_match = re.search(r"(\d+[\.,]?\d*)\s*\(un\)", line_text)
+                
+                if mod_match and qtd_match:
+                    modelo = mod_match.group(1)
+                    quantidade = int(float(qtd_match.group(1).replace(',', '.')))
+                    if quantidade > 0:
+                        dados_v.append({"Equipamento": modelo, "Qtd": quantidade})
 
-st.subheader("📋 Tabela de Produção do Dia")
+        if dados_v:
+            st.session_state.rows = pd.DataFrame(dados_v).drop_duplicates()
+            st.success(f"✅ {len(st.session_state.rows)} modelos identificados!")
+        else:
+            st.warning("⚠️ Tente um print mais focado nas faixas coloridas.")
+
+st.subheader("📋 Tabela de Produção")
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
 if st.button("🚀 GERAR CRONOGRAMA"):
@@ -153,13 +150,6 @@ if st.button("🚀 GERAR CRONOGRAMA"):
         df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia)
         st.divider()
         c1, c2 = st.columns(2)
-        c1.metric("Volume Total", f"{int(total)} un")
-        c2.metric("Hora de Término", fim)
-        st.dataframe(df_res, use_container_width=True, height=500)
-    else:
-        st.error("Tabela vazia!")
-
-if msg_base == "Sucesso":
-    st.sidebar.success("✅ Base Conectada")
-else:
-    st.sidebar.warning(f"⚠️ {msg_base}")
+        c1.metric("Total", f"{int(total)} un")
+        c2.metric("Término", fim)
+        st.dataframe(df_res, use_container_width=True)
