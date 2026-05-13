@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # --- 1. CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="NHS Vision - Automação", page_icon="🏭", layout="wide")
 
-# Configurações do Google Sheets
+# Configurações da Planilha Base
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
 URL_BASE = f"https://docs.google.com/spreadsheets/d/{ID_PLANILHA}/gviz/tq?tqx=out:csv&gid=0"
 
@@ -41,7 +41,7 @@ def carregar_base():
             if m_row != -1: break
             
         if m_row == -1: 
-            return pd.DataFrame(), "Palavra 'MODELO' não encontrada na planilha."
+            return pd.DataFrame(), "Palavra 'MODELO' não encontrada."
         
         dados = df_raw.iloc[m_row+1:].copy()
         lista_final = []
@@ -53,11 +53,9 @@ def carregar_base():
             try:
                 unid_str = str(dados.iloc[i, m_col+1]).replace(',', '.').replace('"', '')
                 unid = pd.to_numeric(unid_str, errors='coerce')
-                
                 ups_linha = str(dados.iloc[i, m_col+3]).strip().upper()
                 if any(x in ups_linha for x in ["UPS", "ACS", "ACE"]):
                     cel_atual = str(dados.iloc[i, m_col+3]).strip().replace('"', '')
-                
                 if not pd.isna(unid):
                     lista_final.append({'ID': mod, 'UNIDADE_HORA': unid, 'CEL_ORIGEM': cel_atual})
             except: continue
@@ -66,7 +64,7 @@ def carregar_base():
     except Exception as e:
         return pd.DataFrame(), f"Erro crítico: {str(e)}"
 
-# --- 3. LÓGICA DE CÁLCULO ---
+# --- 3. MOTOR DE CÁLCULO (Cérebro do Planejamento) ---
 def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
     def para_min(s):
         try:
@@ -106,32 +104,23 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia, tem_gin):
                     min_u += 1
         acum += min_u
         p_h, m_n = 0, []
-        
         if is_alm:
             resultado.append({'Horário': f"{pontos[p]} - {pontos[p+1]}", 'Modelos': "🍱 INTERVALO", 'Peças': 0, 'Acum': int(tot)})
             continue
-            
         while idx < len(df_proc):
             t_pc = df_proc.loc[idx, 'T_PC']
             if t_pc > 0 and acum >= (t_pc - 0.0001):
                 q = min(math.floor(acum / t_pc + 0.0001), df_proc.loc[idx, 'FALTA'])
                 if q > 0:
-                    acum -= (q * t_pc)
-                    df_proc.loc[idx, 'FALTA'] -= q
-                    tot += q
-                    p_h += q
+                    acum -= (q * t_pc); df_proc.loc[idx, 'FALTA'] -= q; tot += q; p_h += q
                     m_n.append(f"{df_proc.loc[idx, 'ID']} ({int(q)})")
                 if df_proc.loc[idx, 'FALTA'] <= 0: idx += 1
                 else: break
             else: break
-            
         resultado.append({'Horário': f"{pontos[p]} - {pontos[p+1]}", 'Modelos': " + ".join(m_n) if m_n else "-", 'Peças': int(p_h), 'Acum': int(tot)})
-        
         if tot >= total_pedir and h_fim == "Finalizado" and total_pedir > 0:
-            min_gastos = min_u - acum
-            dt = datetime.strptime(pontos[p], "%H:%M") + timedelta(minutes=int(min_gastos))
+            dt = datetime.strptime(pontos[p], "%H:%M") + timedelta(minutes=int(min_u - acum))
             h_fim = dt.strftime("%H:%M")
-            
     return pd.DataFrame(resultado), tot, h_fim
 
 # --- 4. INTERFACE STREAMLIT ---
@@ -141,16 +130,17 @@ if st.sidebar.button("🔄 Atualizar Planilha"):
     st.rerun()
 
 base_dados, msg_base = carregar_base()
-sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
-h_ini = st.sidebar.text_input("Início", "07:45")
+sel_ups = st.sidebar.selectbox("Célula de Trabalho", list(MAPA_N_NATURAL.keys()))
+h_ini = st.sidebar.text_input("Horário de Início", "07:45")
 n_dia = st.sidebar.number_input(f"Pessoas na {sel_ups}", 1, 30, value=MAPA_N_NATURAL.get(sel_ups, 5))
-tem_gin = st.sidebar.checkbox("Ginástica Laboral?", value=True)
+tem_gin = st.sidebar.checkbox("Considerar Ginástica Laboral?", value=True)
 
 st.title("📸 NHS Vision - Automação")
 
 if 'rows' not in st.session_state:
     st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
+# Upload de Imagem
 arq = st.file_uploader("Suba o print da programação aqui", type=["png", "jpg", "jpeg"])
 
 if arq:
@@ -181,18 +171,29 @@ if arq:
                     st.session_state.rows = pd.DataFrame(dados_v)
                     st.success(f"✅ Sucesso! {len(dados_v)} itens identificados.")
                 else:
-                    st.warning("⚠️ Não foram encontrados códigos no verde escuro.")
+                    st.warning("⚠️ Não encontrei códigos no verde. Tente um print mais nítido.")
 
+# Tabela Editável
 st.subheader("📋 Dados da Programação")
-df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", width="stretch")
+df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
+# Botão Final para Gerar Cronograma
 if st.button("🚀 GERAR CRONOGRAMA"):
     if not df_editado.empty and not base_dados.empty:
         df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia, tem_gin)
+        
         st.divider()
-        col1, col2 = st.columns(2)
-        col1.metric("Total Planejado", f"{int(total)} peças")
-        col2.metric("Previsão de Término", fim)
-        st.dataframe(df_res, use_container_width=True, height=500)
+        c1, c2 = st.columns(2)
+        c1.metric("Total Planejado", f"{int(total)} peças")
+        c2.metric("Previsão de Término", fim)
+        
+        # Colorir o intervalo de almoço na tabela final
+        def style_rows(row):
+            return ['background-color: #fff3cd'] * len(row) if "INTERVALO" in str(row["Modelos"]) else [''] * len(row)
+            
+        st.dataframe(df_res.style.apply(style_rows, axis=1), use_container_width=True, height=500)
     else:
-        st.error("Tabela vazia ou base não conectada.")
+        st.error("Adicione itens na tabela ou leia uma imagem primeiro.")
+
+if msg_base == "Sucesso":
+    st.sidebar.success("✅ Planilha Base Conectada")
