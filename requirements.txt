@@ -1,6 +1,6 @@
 streamlit
 pandas
 pytesseract
-opencv-python-headless
+opencv-python-headless==4.8.0.74
 Pillow
 requests
