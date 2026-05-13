@@ -10,7 +10,7 @@ from io import StringIO
 import math
 from datetime import datetime, timedelta
 
-# --- 1. CONFIGURAÇÃO ---
+# --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="NHS Vision - Automação", page_icon="🏭", layout="wide")
 
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
@@ -41,7 +41,7 @@ def carregar_base():
     except:
         return pd.DataFrame(), "Erro na Planilha"
 
-# --- 2. MOTOR DE CÁLCULO ---
+# --- MOTOR DE CÁLCULO ---
 def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
     def para_min(s):
         h, m = map(int, s.split(':'))
@@ -55,7 +55,7 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
     pontos = [h_ini] + [m for m in marcos if para_min(m) > m_ini]
     
     df_proc = df_in.merge(df_ba, left_on='Equipamento', right_on='ID', how='left')
-    df_proc['UNIDADE_HORA'] = df_proc['UNIDADE_HORA'].fillna(10)
+    df_proc['UNIDADE_HORA'] = df_proc['UNIDADE_HORA'].fillna(0)
     df_proc['T_PC'] = df_proc['UNIDADE_HORA'].apply(lambda x: 60/x if x > 0 else 0)
     df_proc['FALTA'] = pd.to_numeric(df_proc['Qtd'], errors='coerce').fillna(0)
     
@@ -91,7 +91,7 @@ def calcular_cronograma(df_in, df_ba, h_ini, n_dia):
             h_fim = dt.strftime("%H:%M")
     return pd.DataFrame(resultado), tot, h_fim
 
-# --- 3. INTERFACE ---
+# --- INTERFACE ---
 st.sidebar.title("⚙️ Configurações")
 base_dados, msg_base = carregar_base()
 sel_ups = st.sidebar.selectbox("Célula", list(MAPA_N_NATURAL.keys()))
@@ -105,26 +105,24 @@ if 'rows' not in st.session_state:
 
 arq = st.file_uploader("Upload do Print", type=["png", "jpg", "jpeg"])
 
-if arq and st.button("🔍 IDENTIFICAR TUDO"):
-    with st.spinner("Processando linhas da programação..."):
+if arq and st.button("🔍 IDENTIFICAR E VALIDAR"):
+    with st.spinner("Analisando imagem e conferindo cadastro..."):
         img = Image.open(arq)
         img_np = np.array(img.convert('RGB'))
         img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-        
-        # Filtro para as faixas verdes
         mask = cv2.inRange(img_hsv, np.array([35, 40, 20]), np.array([90, 255, 160]))
         
-        # Encontra os contornos das faixas para ler uma por uma
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        # Ordena de cima para baixo
         contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
         
-        dados_v = []
+        dados_lidos = []
+        nao_cadastrados = []
+        
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
-            if w > 100 and h > 15: # Filtra ruídos pequenos
+            if w > 100 and h > 15:
                 roi = mask[y:y+h, x:x+w]
-                # Aumenta o contraste da linha para o OCR
+                # OCR otimizado para linha única
                 line_text = pytesseract.image_to_string(roi, config='--psm 7')
                 
                 mod_match = re.search(r"((?:85|190|90|01)\.[A-Z0-9\.]+)", line_text)
@@ -133,23 +131,32 @@ if arq and st.button("🔍 IDENTIFICAR TUDO"):
                 if mod_match and qtd_match:
                     modelo = mod_match.group(1)
                     quantidade = int(float(qtd_match.group(1).replace(',', '.')))
+                    
                     if quantidade > 0:
-                        dados_v.append({"Equipamento": modelo, "Qtd": quantidade})
+                        # VERIFICAÇÃO DE CADASTRO
+                        if modelo in base_dados['ID'].values:
+                            dados_lidos.append({"Equipamento": modelo, "Qtd": quantidade})
+                        else:
+                            nao_cadastrados.append(modelo)
 
-        if dados_v:
-            st.session_state.rows = pd.DataFrame(dados_v).drop_duplicates()
-            st.success(f"✅ {len(st.session_state.rows)} modelos identificados!")
+        # LOGICA DE AVISO
+        if nao_cadastrados:
+            itens_erro = ", ".join(list(set(nao_cadastrados)))
+            st.error(f"🛑 ERRO DE CADASTRO: Os seguintes itens não foram encontrados na Planilha Base: **{itens_erro}**")
+            st.info("Por favor, adicione esses modelos na aba 'BASE' do Google Sheets e clique em 'Atualizar Planilha'.")
+            st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
+        elif dados_lidos:
+            st.session_state.rows = pd.DataFrame(dados_lidos).drop_duplicates()
+            st.success(f"✅ {len(st.session_state.rows)} equipamentos validados com sucesso!")
         else:
-            st.warning("⚠️ Tente um print mais focado nas faixas coloridas.")
+            st.warning("Nenhum equipamento com quantidade válida foi detectado no print.")
 
-st.subheader("📋 Tabela de Produção")
+st.subheader("📋 Dados Identificados")
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
 if st.button("🚀 GERAR CRONOGRAMA"):
     if not df_editado.empty:
         df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia)
         st.divider()
-        c1, c2 = st.columns(2)
-        c1.metric("Total", f"{int(total)} un")
-        c2.metric("Término", fim)
+        st.metric("Término Previsto", fim)
         st.dataframe(df_res, use_container_width=True)
