@@ -23,24 +23,30 @@ MAPA_N_NATURAL = {
     "UPS - 6": 4, "UPS - 7": 4, "UPS - 8": 4, "ACS - 01": 3,
 }
 
-# --- 2. FUNÇÃO PARA CARREGAR A BASE (Cérebro do App 1) ---
+# --- 2. FUNÇÃO PARA CARREGAR A BASE ---
 @st.cache_data(ttl=60)
 def carregar_base():
     try:
-        response = requests.get(URL_BASE, timeout=10)
+        # Tenta carregar a planilha diretamente como CSV
+        response = requests.get(URL_BASE, timeout=15)
+        if response.status_code != 200:
+            return pd.DataFrame()
+            
         df_raw = pd.read_csv(StringIO(response.text), header=None).astype(str)
         
-        # Procura onde começa a tabela pela palavra "MODELO"
+        # Procura a célula que contém "MODELO" (ignora maiúsculas/minúsculas)
         m_row, m_col = -1, -1
-        for r in range(min(50, len(df_raw))):
+        for r in range(min(100, len(df_raw))):
             for c in range(len(df_raw.columns)):
-                if "MODELO" in str(df_raw.iloc[r, c]).upper():
+                if "MODELO" in str(df_raw.iloc[r, c]).upper().strip():
                     m_row, m_col = r, c
                     break
             if m_row != -1: break
             
-        if m_row == -1: return pd.DataFrame()
+        if m_row == -1:
+            return pd.DataFrame()
         
+        # Extrai os dados a partir da linha encontrada
         dados = df_raw.iloc[m_row+1:].copy()
         lista_final = []
         cel_atual = "Indefinida"
@@ -48,8 +54,11 @@ def carregar_base():
         for i in range(len(dados)):
             mod = str(dados.iloc[i, m_col]).strip()
             try:
-                # Pega unidade/hora e a célula de origem da linha
-                unid = pd.to_numeric(dados.iloc[i, m_col+1].replace(',', '.'), errors='coerce')
+                # Unidade/Hora está na coluna ao lado do Modelo
+                unid_str = str(dados.iloc[i, m_col+1]).replace(',', '.')
+                unid = pd.to_numeric(unid_str, errors='coerce')
+                
+                # Célula de origem está 3 colunas à direita do Modelo
                 ups_linha = str(dados.iloc[i, m_col+3]).strip().upper()
                 
                 if any(x in ups_linha for x in ["UPS", "ACS", "ACE"]):
@@ -65,11 +74,10 @@ def carregar_base():
             
         return pd.DataFrame(lista_final)
     except Exception as e:
-        st.error(f"Erro ao carregar planilha: {e}")
         return pd.DataFrame()
 
-# --- 3. LÓGICA DE CÁLCULO DO CRONOGRAMA ---
-def calcular_cronograma(df_input, df_base, h_ini, n_dia, tem_gin, sel_ups):
+# --- 3. LÓGICA DE CÁLCULO ---
+def calcular_cronograma(df_input, df_base, h_ini, n_dia, tem_gin):
     def para_min(s):
         h, m = map(int, s.split(':'))
         return h * 60 + m
@@ -82,10 +90,9 @@ def calcular_cronograma(df_input, df_base, h_ini, n_dia, tem_gin, sel_ups):
     marcos = ["08:30", "09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30", "16:30", "17:30"]
     pontos = [h_ini] + [m for m in marcos if para_min(m) > m_ini]
     
-    # Cruza dados da leitura com a base para pegar a cadência
+    # Cruza os dados lidos com a base da planilha
     df_proc = df_input.merge(df_base, left_on='Equipamento', right_on='ID', how='left')
     
-    # Cálculo da Cadência Real Ajustada pelas pessoas do dia
     def calc_cad(row):
         n_nom = MAPA_N_NATURAL.get(row['CEL_ORIGEM'], 5)
         return (row['UNIDADE_HORA'] / n_nom) * n_dia
@@ -102,8 +109,8 @@ def calcular_cronograma(df_input, df_base, h_ini, n_dia, tem_gin, sel_ups):
     for p in range(len(pontos)-1):
         p1, p2 = para_min(pontos[p]), para_min(pontos[p+1])
         is_alm = (p1 == m_alm_i and p2 == m_alm_f)
-        
         min_uteis = 0
+        
         if not is_alm:
             for m in range(p1, p2):
                 if not ((m_cafe_m <= m < m_cafe_m+10) or (m_cafe_t <= m < m_cafe_t+10) or 
@@ -127,7 +134,6 @@ def calcular_cronograma(df_input, df_base, h_ini, n_dia, tem_gin, sel_ups):
                     tot += qtd_pode
                     p_hora += qtd_pode
                     modelos_h.append(f"{df_proc.loc[idx, 'ID']} ({int(qtd_pode)})")
-                
                 if df_proc.loc[idx, 'FALTA'] <= 0: idx += 1
                 else: break
             else: break
@@ -141,7 +147,7 @@ def calcular_cronograma(df_input, df_base, h_ini, n_dia, tem_gin, sel_ups):
 
     return pd.DataFrame(resultado), tot, h_fim
 
-# --- 4. INTERFACE DO USUÁRIO ---
+# --- 4. INTERFACE ---
 base_dados = carregar_base()
 
 st.sidebar.title("🏭 Configurações")
@@ -151,9 +157,8 @@ h_ini = st.sidebar.text_input("Início da Produção", "07:45")
 n_dia = st.sidebar.number_input(f"Pessoas na {sel_ups}", 1, 25, value=n_sugerido)
 tem_gin = st.sidebar.checkbox("🤸 Ginástica Laboral?", value=True)
 
-st.title("📸 NHS Vision - Automação de Planejamento")
+st.title("📸 NHS Vision - Automação")
 
-# Inicializa a tabela na memória do navegador
 if 'rows' not in st.session_state:
     st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
@@ -163,49 +168,41 @@ arq = st.file_uploader("Suba o print da programação aqui", type=["png", "jpg",
 if arq:
     img = Image.open(arq)
     if st.button("🔍 LER IMAGEM E PREENCHER"):
-        with st.spinner("Lendo modelos e quantidades..."):
-            img_np = np.array(img.convert('RGB'))
-            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-            _, thresh = cv2.threshold(gray, 155, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            texto_extraido = pytesseract.image_to_string(thresh)
-            
-            # Padrões: 85... ou 190... e números antes de (un)
-            p_mods = re.findall(r"((?:85|190)\.[A-Z0-9\.]+)", texto_extraido)
-            p_qtds = re.findall(r"(\d+[\.,]\d+|\d+)\s*\(un\)", texto_extraido)
-            
-            dados_validados = []
-            if not base_dados.empty:
+        if base_dados.empty:
+            st.error("Erro: A Planilha Base não pôde ser carregada. Verifique se a aba BASE é a primeira da planilha e se contém a coluna 'MODELO'.")
+        else:
+            with st.spinner("Processando imagem..."):
+                img_np = np.array(img.convert('RGB'))
+                gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+                _, thresh = cv2.threshold(gray, 155, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                texto = pytesseract.image_to_string(thresh)
+                
+                p_mods = re.findall(r"((?:85|190)\.[A-Z0-9\.]+)", texto)
+                p_qtds = re.findall(r"(\d+[\.,]\d+|\d+)\s*\(un\)", texto)
+                
+                dados_v = []
                 for m, q in zip(p_mods, p_qtds):
                     if m in base_dados['ID'].values:
-                        dados_validados.append({"Equipamento": m, "Qtd": int(float(q.replace(',', '.')))})
+                        dados_v.append({"Equipamento": m, "Qtd": int(float(q.replace(',', '.')))})
+                    else:
+                        st.warning(f"Modelo {m} não encontrado na base de dados.")
                 
-                if dados_validados:
-                    st.session_state.rows = pd.DataFrame(dados_validados)
-                    st.success(f"Encontrados {len(dados_validados)} modelos válidos!")
-                else:
-                    st.warning("Nenhum modelo da imagem bate com a Planilha Base.")
-            else:
-                st.error("Erro: A Planilha Base não foi carregada.")
+                if dados_v:
+                    st.session_state.rows = pd.DataFrame(dados_v)
+                    st.success("Tabela preenchida!")
 
-# Tabela editável
-st.subheader("📋 Tabela de Produção (Confirme os dados)")
+st.subheader("📋 Tabela de Produção")
 df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
-# Botão Final
-if st.button("🚀 GERAR CRONOGRAMA DETALHADO"):
+if st.button("🚀 GERAR CRONOGRAMA"):
     if not df_editado.empty:
-        df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia, tem_gin, sel_ups)
-        
+        df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia, tem_gin)
         st.divider()
-        col1, col2 = st.columns(2)
-        col1.metric("Total de Peças", f"{int(total)} un")
-        col2.metric("Previsão de Término", fim)
+        c1, c2 = st.columns(2)
+        c1.metric("Total Peças", f"{int(total)} un")
+        c2.metric("Término", fim)
         
-        # Estilização da tabela final
-        def colorir_intervalo(row):
+        def cor_intervalo(row):
             return ['background-color: #f8d7da'] * len(row) if "ALMOÇO" in str(row["Modelos"]) else [''] * len(row)
         
-        st.dataframe(df_res.style.apply(colorir_intervalo, axis=1), use_container_width=True, height=500)
-    else:
-        st.error("A tabela está vazia. Adicione itens ou leia uma imagem.")
+        st.dataframe(df_res.style.apply(cor_intervalo, axis=1), use_container_width=True, height=500)
