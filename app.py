@@ -10,52 +10,66 @@ from io import StringIO
 import math
 from datetime import datetime, timedelta
 
-# 1. CONFIGURAÇÃO E MAPEAMENTO
+# --- 1. CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="NHS Vision - Planejamento", page_icon="🏭", layout="wide")
 
+# Link da sua planilha (Aba BASE)
 ID_PLANILHA = "11-jv_ZFetz9xdbJY8JZwPFSc3gtB65duvtDlLEk4I2E"
 URL_BASE = f"https://docs.google.com/spreadsheets/d/{ID_PLANILHA}/export?format=csv&gid=0"
 
+# Mapeamento de pessoas por célula (N Natural)
 MAPA_N_NATURAL = {
     "UPS - 1": 5, "UPS - 2": 3, "UPS - 3": 3, "UPS - 4": 3,
     "UPS - 6": 4, "UPS - 7": 4, "UPS - 8": 4, "ACS - 01": 3,
 }
 
-@st.cache_data(ttl=10)
+# --- 2. FUNÇÃO PARA CARREGAR A BASE (Cérebro do App 1) ---
+@st.cache_data(ttl=60)
 def carregar_base():
     try:
         response = requests.get(URL_BASE, timeout=10)
         df_raw = pd.read_csv(StringIO(response.text), header=None).astype(str)
+        
+        # Procura onde começa a tabela pela palavra "MODELO"
         m_row, m_col = -1, -1
         for r in range(min(50, len(df_raw))):
             for c in range(len(df_raw.columns)):
-                if str(df_raw.iloc[r, c]).strip().upper() == "MODELO":
+                if "MODELO" in str(df_raw.iloc[r, c]).upper():
                     m_row, m_col = r, c
                     break
             if m_row != -1: break
+            
         if m_row == -1: return pd.DataFrame()
         
         dados = df_raw.iloc[m_row+1:].copy()
-        lista_final, cel_atual = [], "Indefinida"
+        lista_final = []
+        cel_atual = "Indefinida"
+        
         for i in range(len(dados)):
             mod = str(dados.iloc[i, m_col]).strip()
             try:
+                # Pega unidade/hora e a célula de origem da linha
                 unid = pd.to_numeric(dados.iloc[i, m_col+1].replace(',', '.'), errors='coerce')
                 ups_linha = str(dados.iloc[i, m_col+3]).strip().upper()
+                
                 if any(x in ups_linha for x in ["UPS", "ACS", "ACE"]):
                     cel_atual = str(dados.iloc[i, m_col+3]).strip()
+                
                 if mod != 'nan' and len(mod) > 5 and not pd.isna(unid):
                     lista_final.append({
-                        'ID': mod, 'UNIDADE_HORA': unid, 
-                        'CEL_ORIGEM': cel_atual, 
-                        'DISPLAY': f"[{cel_atual}] {mod}"
+                        'ID': mod, 
+                        'UNIDADE_HORA': unid, 
+                        'CEL_ORIGEM': cel_atual
                     })
             except: continue
+            
         return pd.DataFrame(lista_final)
-    except: return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Erro ao carregar planilha: {e}")
+        return pd.DataFrame()
 
-# --- REGRAS DE CÁLCULO (CÉREBRO DO APP 1) ---
-def calcular(df_in, df_ba, h_ini, n_dia, tem_gin, sel_ups):
+# --- 3. LÓGICA DE CÁLCULO DO CRONOGRAMA ---
+def calcular_cronograma(df_input, df_base, h_ini, n_dia, tem_gin, sel_ups):
     def para_min(s):
         h, m = map(int, s.split(':'))
         return h * 60 + m
@@ -68,110 +82,130 @@ def calcular(df_in, df_ba, h_ini, n_dia, tem_gin, sel_ups):
     marcos = ["08:30", "09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30", "16:30", "17:30"]
     pontos = [h_ini] + [m for m in marcos if para_min(m) > m_ini]
     
-    # Merge para pegar a cadência correta da planilha
-    df_in = df_in.merge(df_ba, left_on='Equipamento', right_on='ID', how='left')
+    # Cruza dados da leitura com a base para pegar a cadência
+    df_proc = df_input.merge(df_base, left_on='Equipamento', right_on='ID', how='left')
     
-    def calcular_cadencia_real(row):
-        n_nominal = MAPA_N_NATURAL.get(row['CEL_ORIGEM'], 5)
-        return (row['UNIDADE_HORA'] / n_nominal) * n_dia
+    # Cálculo da Cadência Real Ajustada pelas pessoas do dia
+    def calc_cad(row):
+        n_nom = MAPA_N_NATURAL.get(row['CEL_ORIGEM'], 5)
+        return (row['UNIDADE_HORA'] / n_nom) * n_dia
 
-    df_in['CAD_R'] = df_in.apply(calcular_cadencia_real, axis=1)
-    df_in['T_PC'] = 60 / df_in['CAD_R']
-    df_in['FALTA'] = pd.to_numeric(df_in['Qtd'])
+    df_proc['CAD_R'] = df_proc.apply(calc_cad, axis=1)
+    df_proc['T_PC'] = 60 / df_proc['CAD_R']
+    df_proc['FALTA'] = pd.to_numeric(df_proc['Qtd'])
     
-    res, total_ped = [], df_in['FALTA'].sum()
-    acum, idx, tot, termino = 0.0, 0, 0, "Não finalizado"
+    resultado = []
+    idx, acum, tot = 0, 0.0, 0
+    total_pedir = df_proc['FALTA'].sum()
+    h_fim = "Não finalizado"
 
     for p in range(len(pontos)-1):
         p1, p2 = para_min(pontos[p]), para_min(pontos[p+1])
         is_alm = (p1 == m_alm_i and p2 == m_alm_f)
-        min_u = 0
+        
+        min_uteis = 0
         if not is_alm:
             for m in range(p1, p2):
                 if not ((m_cafe_m <= m < m_cafe_m+10) or (m_cafe_t <= m < m_cafe_t+10) or 
                         (m_alm_i <= m < m_alm_f) or (tem_gin and m_gin_i <= m < m_gin_f)):
-                    min_u += 1
-        acum += min_u
-        p_h, m_n = 0, []
+                    min_uteis += 1
+        
+        acum += min_uteis
+        p_hora, modelos_h = 0, []
+        
         if is_alm:
-            res.append({'Horário': f"{pontos[p]} – {pontos[p+1]}", 'Modelos': "🍱 INTERVALO", 'Peças': 0, 'Acum': int(tot)})
+            resultado.append({'Horário': f"{pontos[p]} – {pontos[p+1]}", 'Modelos': "🍱 ALMOÇO", 'Peças': 0, 'Acum': int(tot)})
             continue
-        while idx < len(df_in):
-            t_pc = df_in.loc[idx, 'T_PC']
-            if acum >= (t_pc - 0.001):
-                q = min(math.floor(acum / t_pc + 0.001), df_in.loc[idx, 'FALTA'])
-                if q > 0:
-                    acum -= (q * t_pc); df_in.loc[idx, 'FALTA'] -= q
-                    tot += q; p_h += q
-                    m_n.append(f"{df_in.loc[idx, 'ID']} ({int(q)})")
-                if df_in.loc[idx, 'FALTA'] <= 0: idx += 1
+
+        while idx < len(df_proc):
+            t_pc = df_proc.loc[idx, 'T_PC']
+            if acum >= (t_pc - 0.0001):
+                qtd_pode = min(math.floor(acum / t_pc + 0.0001), df_proc.loc[idx, 'FALTA'])
+                if qtd_pode > 0:
+                    acum -= (qtd_pode * t_pc)
+                    df_proc.loc[idx, 'FALTA'] -= qtd_pode
+                    tot += qtd_pode
+                    p_hora += qtd_pode
+                    modelos_h.append(f"{df_proc.loc[idx, 'ID']} ({int(qtd_pode)})")
+                
+                if df_proc.loc[idx, 'FALTA'] <= 0: idx += 1
                 else: break
             else: break
-        res.append({'Horário': f"{pontos[p]} – {pontos[p+1]}", 'Modelos': " + ".join(m_n) if m_n else "-", 'Peças': int(p_h), 'Acum': int(tot)})
-        if tot >= total_ped and termino == "Não finalizado" and total_ped > 0:
-            sobra = min_u - acum
-            dt = datetime.strptime(pontos[p], "%H:%M") + timedelta(minutes=int(sobra))
-            termino = dt.strftime("%H:%M")
-    return {'df': pd.DataFrame(res), 'tot': tot, 'termino': termino}
+            
+        resultado.append({'Horário': f"{pontos[p]} – {pontos[p+1]}", 'Modelos': " + ".join(modelos_h) if modelos_h else "-", 'Peças': int(p_hora), 'Acum': int(tot)})
+        
+        if tot >= total_pedir and h_fim == "Não finalizado" and total_pedir > 0:
+            sobra_min = min_uteis - acum
+            dt = datetime.strptime(pontos[p], "%H:%M") + timedelta(minutes=int(sobra_min))
+            h_fim = dt.strftime("%H:%M")
 
-# --- INTERFACE ---
-base = carregar_base()
+    return pd.DataFrame(resultado), tot, h_fim
 
-st.sidebar.markdown("### Tecnologia de Processos")
-st.sidebar.title("🏭 NHS Vision")
+# --- 4. INTERFACE DO USUÁRIO ---
+base_dados = carregar_base()
+
+st.sidebar.title("🏭 Configurações")
 sel_ups = st.sidebar.selectbox("Célula de Trabalho", list(MAPA_N_NATURAL.keys()))
 n_sugerido = MAPA_N_NATURAL.get(sel_ups, 5)
 h_ini = st.sidebar.text_input("Início da Produção", "07:45")
-n_dia = st.sidebar.number_input(f"Pessoas na {sel_ups}", 1, 20, value=n_sugerido)
-tem_gin = st.sidebar.checkbox("🤸 Ginástica Laboral?")
+n_dia = st.sidebar.number_input(f"Pessoas na {sel_ups}", 1, 25, value=n_sugerido)
+tem_gin = st.sidebar.checkbox("🤸 Ginástica Laboral?", value=True)
 
-st.header(f"📋 Planejamento NHS: {sel_ups}")
+st.title("📸 NHS Vision - Automação de Planejamento")
 
-# Lógica de OCR
-arquivo = st.file_uploader("Cole o print da programação aqui", type=["png", "jpg", "jpeg"])
+# Inicializa a tabela na memória do navegador
+if 'rows' not in st.session_state:
+    st.session_state.rows = pd.DataFrame(columns=["Equipamento", "Qtd"])
 
-if 'dados_lidos' not in st.session_state:
-    st.session_state.dados_lidos = pd.DataFrame(columns=["Equipamento", "Qtd"])
+# Upload e OCR
+arq = st.file_uploader("Suba o print da programação aqui", type=["png", "jpg", "jpeg"])
 
-if arquivo:
-    img = Image.open(arquivo)
-    if st.button("🔍 LER IMAGEM E PREENCHER TABELA"):
-        with st.spinner("Processando imagem..."):
+if arq:
+    img = Image.open(arq)
+    if st.button("🔍 LER IMAGEM E PREENCHER"):
+        with st.spinner("Lendo modelos e quantidades..."):
             img_np = np.array(img.convert('RGB'))
             gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-            _, thresh = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            texto = pytesseract.image_to_string(thresh)
+            _, thresh = cv2.threshold(gray, 155, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             
-            # Regex para buscar Modelo (85... ou 190...) e Quantidade
-            modelos = re.findall(r"((?:85|190)\.[A-Z0-9\.]+)", texto)
-            qtds = re.findall(r"(\d+[\.,]\d+|\d+)\s*\(un\)", texto)
+            texto_extraido = pytesseract.image_to_string(thresh)
             
-            lista_valida = []
-            for m, q in zip(modelos, qtds):
-                if m in base['ID'].values:
-                    lista_valida.append({"Equipamento": m, "Qtd": q})
+            # Padrões: 85... ou 190... e números antes de (un)
+            p_mods = re.findall(r"((?:85|190)\.[A-Z0-9\.]+)", texto_extraido)
+            p_qtds = re.findall(r"(\d+[\.,]\d+|\d+)\s*\(un\)", texto_extraido)
+            
+            dados_validados = []
+            if not base_dados.empty:
+                for m, q in zip(p_mods, p_qtds):
+                    if m in base_dados['ID'].values:
+                        dados_validados.append({"Equipamento": m, "Qtd": int(float(q.replace(',', '.')))})
+                
+                if dados_validados:
+                    st.session_state.rows = pd.DataFrame(dados_validados)
+                    st.success(f"Encontrados {len(dados_validados)} modelos válidos!")
                 else:
-                    st.warning(f"Atenção: Modelo {m} lido na imagem não foi encontrado na planilha BASE!")
-            
-            if lista_valida:
-                st.session_state.dados_lidos = pd.DataFrame(lista_valida)
-                st.success("Tabela preenchida com sucesso!")
+                    st.warning("Nenhum modelo da imagem bate com a Planilha Base.")
+            else:
+                st.error("Erro: A Planilha Base não foi carregada.")
 
-# Editor de Dados (pode ser manual ou preenchido pelo OCR)
-df_ed = st.data_editor(st.session_state.dados_lidos, num_rows="dynamic", use_container_width=True,
-                       column_config={"Equipamento": st.column_config.TextColumn("Modelo (ID)"),
-                                      "Qtd": st.column_config.NumberColumn("Qtd", min_value=1)})
+# Tabela editável
+st.subheader("📋 Tabela de Produção (Confirme os dados)")
+df_editado = st.data_editor(st.session_state.rows, num_rows="dynamic", use_container_width=True)
 
-if st.button("🚀 GERAR PLANEJAMENTO"):
-    df_v = df_ed.dropna(subset=['Equipamento'])
-    if not df_v.empty:
-        r = calcular(df_v, base, h_ini, n_dia, tem_gin, sel_ups)
+# Botão Final
+if st.button("🚀 GERAR CRONOGRAMA DETALHADO"):
+    if not df_editado.empty:
+        df_res, total, fim = calcular_cronograma(df_editado, base_dados, h_ini, n_dia, tem_gin, sel_ups)
+        
         st.divider()
-        c1, c2 = st.columns(2)
-        c1.metric("Total Planejado", f"{int(r['tot'])} pçs")
-        c2.metric("Término Estimado", r['termino'])
+        col1, col2 = st.columns(2)
+        col1.metric("Total de Peças", f"{int(total)} un")
+        col2.metric("Previsão de Término", fim)
         
-        def style_row(row):
-            return ['background-color: #fff3cd'] * len(row) if "INTERVALO" in str(row["Modelos"]) else [''] * len(row)
+        # Estilização da tabela final
+        def colorir_intervalo(row):
+            return ['background-color: #f8d7da'] * len(row) if "ALMOÇO" in str(row["Modelos"]) else [''] * len(row)
         
-        st.dataframe(r['df'].style.apply(style_row, axis=1), use_container_width=True, height=450)
+        st.dataframe(df_res.style.apply(colorir_intervalo, axis=1), use_container_width=True, height=500)
+    else:
+        st.error("A tabela está vazia. Adicione itens ou leia uma imagem.")
