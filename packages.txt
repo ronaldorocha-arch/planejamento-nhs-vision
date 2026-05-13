@@ -1,3 +1,2 @@
-streamlit
-pandas
-pytesseract
+tesseract-ocr
+libgl1-mesa-glx
